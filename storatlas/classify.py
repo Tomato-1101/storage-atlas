@@ -118,6 +118,8 @@ def classify(dirs, files, ruleset=None, now=None):
                 continue
             if r.sibling and (p is None or not _ok_markers(dirs[p][D_MARK], r.sibling)):
                 continue
+            if r.sibling_also and (p is None or not _ok_markers(dirs[p][D_MARK], r.sibling_also)):
+                continue
             if r.min_age_days and now - d[D_TMTIME] < r.min_age_days * 86400:
                 continue
             if r.excludes and any(x.fullmatch(path) for x in r.excludes):
@@ -131,9 +133,11 @@ def classify(dirs, files, ruleset=None, now=None):
 
     for f in files:
         fpath, did, alloc, size, mtime = f[0], f[1], f[2], f[3], f[4]
-        if owner[did] != -1:
-            continue
+        o = owner[did]
         for r in rs.file_rules:
+            # ディレクトリ規則の方が上にあれば、配下のファイルもそちらが持つ
+            if o != -1 and r.order > matches[o].rule.order:
+                break
             if not any(rx.fullmatch(fpath) for rx in r.regexes):
                 continue
             if r.min_age_days and now - mtime < r.min_age_days * 86400:
@@ -142,6 +146,9 @@ def classify(dirs, files, ruleset=None, now=None):
                 continue
             matches.append(Match(r, fpath, "file", alloc, 1, mtime, did))
             res.file_owner[fpath] = len(matches) - 1
+            if o != -1:  # 上位のファイル規則が親ディレクトリの規則から切り出す（二重計上しない）
+                matches[o].alloc -= alloc
+                matches[o].files -= 1
             break
 
     # 覆われた量を祖先へ足す（区域でない規則を先に。区域は「中の他規則を除いた残り」を深い順に）

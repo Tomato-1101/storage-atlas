@@ -7,19 +7,31 @@ from . import util
 from .classify import SAFETIES, hotspots
 from .scanner import D_PATH, D_TALLOC
 
-T = util.tilde
+T = util.disp
 H = util.human
+TRASH_NOTE = ("> stor はゴミ箱へ移すだけ。ゴミ箱を空にするまで空き容量は増えない。"
+              "サイズは索引上の値。実行前に `stor clean <id>`（dry-run）で一覧を確認")
 
 
 def growth(con):
-    """直近 2 回の走査の差分（ディレクトリ単位）。子 1 つで 8 割以上説明できる親は子に譲る。"""
-    snaps = con.execute("SELECT id, started FROM snapshots ORDER BY id DESC LIMIT 2").fetchall()
+    """直近 2 回の走査の差分（ディレクトリ単位）。子 1 つで 8 割以上説明できる親は子に譲る。
+    stor 自身の索引（STOR_HOME）の増減は除く。"""
+    snaps = con.execute("SELECT id, started, roots FROM snapshots ORDER BY id DESC LIMIT 2").fetchall()
     if len(snaps) < 2:
         return None
     cur_id, prev_id = snaps[0][0], snaps[1][0]
     cur = dict(con.execute("SELECT path, tot_alloc FROM hist WHERE snap=?", (cur_id,)))
     prev = dict(con.execute("SELECT path, tot_alloc FROM hist WHERE snap=?", (prev_id,)))
     delta = {p: cur.get(p, 0) - prev.get(p, 0) for p in set(cur) | set(prev)}
+    own = os.path.realpath(util.stor_home())
+    own_d = cur.get(own, 0) - prev.get(own, 0)
+    a = os.path.dirname(own)
+    while own_d and a != os.path.dirname(a):
+        if a in delta:
+            delta[a] -= own_d
+        a = os.path.dirname(a)
+    for p in [p for p in delta if p == own or p.startswith(own + "/")]:
+        del delta[p]
     kids = {}
     for p in delta:
         kids.setdefault(os.path.dirname(p), []).append(p)
@@ -34,7 +46,8 @@ def growth(con):
     items = [(p, d, cur.get(p, 0)) for p, d in delta.items() if d != 0 and not explained(p, d)]
     up = sorted((t for t in items if t[1] > 0), key=lambda t: -t[1])
     down = sorted((t for t in items if t[1] < 0), key=lambda t: t[1])
-    return {"from": snaps[1][1], "to": snaps[0][1], "up": up, "down": down}
+    return {"from": snaps[1][1], "to": snaps[0][1], "up": up, "down": down,
+            "roots_changed": snaps[0][2] != snaps[1][2]}
 
 
 def build(con, res, snap, max_age):
@@ -64,6 +77,7 @@ def build(con, res, snap, max_age):
         "stale_index": now - snap["started"] > max_age,
         "total": total,
         "rules": {rid: {"id": rid, "name": a["rule"].name, "safety": a["rule"].safety, "action": a["rule"].action,
+                        "note": a["rule"].note,
                         "alloc": a["alloc"], "count": a["count"], "stale_alloc": a["stale_alloc"],
                         "stale_count": a["stale_count"],
                         "top": [(m.path, m.alloc) for m in a["items"][:3]]} for rid, a in agg.items()},
@@ -78,7 +92,7 @@ def build(con, res, snap, max_age):
     }
 
 
-def render(d, lim):
+def _head(d):
     s = d["snapshot"]
     L = []
     if d["stale_index"]:
@@ -86,29 +100,40 @@ def render(d, lim):
     use = s["df_used"] / max(1, s["df_used"] + s["df_free"]) * 100
     L.append(f"# 空き {H(s['df_free'])} / 使用率 {use:.0f}% / 索引 {util.fmt_time(s['started'])}"
              f"（{util.age_text(d['age'])}前）/ 走査 {s['duration']:.0f}秒")
+    L.append(TRASH_NOTE)
+    return L
+
+
+def _note(r):
+    return f"［注意: {r['note']}］" if r.get("note") else ""
+
+
+def render(d, lim):
+    s = d["snapshot"]
+    L = _head(d)
 
     def rules_of(safety):
         return sorted((r for r in d["rules"].values() if r["safety"] == safety), key=lambda r: -r["alloc"])
 
     regen = rules_of("regen")
-    L.append(f"\n## すぐ空けられる（regen）計 {H(sum(r['alloc'] for r in regen))}")
+    L.append(f"\n## 再生成可能な候補（regen・索引上のサイズ）計 {H(sum(r['alloc'] for r in regen))}")
     for r in regen[:lim["regen"]]:
         line = f"- {r['id']}（{r['name']}）{H(r['alloc'])} {r['count']}件"
         if r["stale_count"]:
             line += f"（うち放置プロジェクト分 {H(r['stale_alloc'])}/{r['stale_count']}件 → `--stale`）"
         kind, _, arg = r["action"].partition(":")
-        line += f" → {arg}" if kind == "info" else f" → `stor clean {r['id']} --yes`（ゴミ箱へ）"
-        L.append(line)
+        line += f" → {arg}" if kind == "info" else f" → `stor clean {r['id']}`（dry-run → 確認後 --yes でゴミ箱へ）"
+        L.append(line + _note(r))
     if len(regen) > lim["regen"]:
         L.append(f"- 他 {len(regen) - lim['regen']} 規則 {H(sum(r['alloc'] for r in regen[lim['regen']:]))}（`stor rules`）")
 
     review = rules_of("review")
-    L.append(f"\n## 本人判断（review）計 {H(sum(r['alloc'] for r in review))}")
+    L.append(f"\n## 本人判断の候補（review・索引上のサイズ）計 {H(sum(r['alloc'] for r in review))}")
     for r in review[:lim["review"]]:
         tops = ", ".join(f"{T(p)} {H(a)}" for p, a in r["top"][:lim["review_top"]])
         kind, _, arg = r["action"].partition(":")
-        how = arg if kind == "info" else f"`stor clean {r['id']}`（ゴミ箱へ）"
-        L.append(f"- {r['id']}（{r['name']}）{H(r['alloc'])} {r['count']}件: {tops} ／ {how}")
+        how = arg if kind == "info" else f"`stor clean {r['id']}`（dry-run）"
+        L.append(f"- {r['id']}（{r['name']}）{H(r['alloc'])} {r['count']}件: {tops} ／ {how}{_note(r)}")
     if len(review) > lim["review"]:
         L.append(f"- 他 {len(review) - lim['review']} 規則（`stor rules`）")
 
@@ -137,7 +162,8 @@ def render(d, lim):
         L.append("- 前回の走査なし")
     else:
         ups = [t for t in g["up"] if t[1] >= 10 * util.MB][:lim["growth"]]
-        L.append(f"（{util.fmt_time(g['from'])} → {util.fmt_time(g['to'])}）" + ("" if ups else " 10MB 以上の増加なし"))
+        L.append(f"（{util.fmt_time(g['from'])} → {util.fmt_time(g['to'])}）" + ("" if ups else " 10MB 以上の増加なし")
+                 + ("（root 構成が前回と違う）" if g["roots_changed"] else ""))
         for p, dd, cur in ups:
             L.append(f"- {T(p)} +{H(dd)}（現在 {H(cur)}）")
 
@@ -165,10 +191,22 @@ LEVELS = [
 ]
 
 
+def render_min(d):
+    """最小形（安全上の注意と区分ごとの合計だけ）。"""
+    L = _head(d)
+    for safety, title in (("regen", "再生成可能な候補"), ("review", "本人判断の候補")):
+        tot = sum(r["alloc"] for r in d["rules"].values() if r["safety"] == safety)
+        L.append(f"- {title}（{safety}・索引上のサイズ）計 {H(tot)}（内訳は `stor rules`）")
+    return "\n".join(L)
+
+
 def render_budget(d, budget):
-    text = ""
+    """budget は上限。どの段階でも収まらなければ最小形にし、それでも超えるなら超過を明示する。"""
     for lim in LEVELS:
         text = render(d, lim)
         if util.est_tokens(text) <= budget:
-            break
-    return text
+            return text
+    text = render_min(d) + f"\n（budget {budget} に収めるため最小形。詳細は --budget を上げる）"
+    if util.est_tokens(text) <= budget:
+        return text
+    return render_min(d) + f"\n（budget {budget} トークンを超過: 最小形でも約 {util.est_tokens(render_min(d))}）"

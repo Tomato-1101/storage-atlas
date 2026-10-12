@@ -7,6 +7,9 @@ container=True の規則は「区域」で、配下で他の規則に当たっ�
   id, name, safety(regen|review|personal), regen(再生成のされ方), action,
   paths(glob。~ は HOME、* は 1 階層内、**/ は任意の深さ), kind(dir|file。既定 dir),
   child(このディレクトリ直下にどれかがあること), sibling(親ディレクトリ直下にどれかがあること),
+  sibling_also(sibling に加えて、親ディレクトリ直下にこのどれかもあること。再構築の根拠＝lockfile 等),
+  （child・sibling 系の判定に使うのは通常ファイルだけ。.git は種類を問わない）
+  note(report に出す注意事項),
   min_age_days(最終更新がこれより古いものだけ), stale_days(親=プロジェクトの最終更新がこれより古ければ「放置」と強調),
   exclude(この glob に当たるパスでは適用しない)
 action: "trash"（/usr/bin/trash でゴミ箱へ）/ "info:<案内文>"（表示するだけ。stor は動かさない）
@@ -18,23 +21,40 @@ import re
 # プロジェクト成果物の規則を当てない場所。ツール・アプリが自分で入れた node_modules / venv は
 # 消すとツールが壊れる（例: /opt/homebrew/lib/node_modules の CLI、~/.vscode の拡張、MCP サーバーの venv）。
 TOOL_AREAS = ["~/.*/**", "~/Library/**", "/Applications/**", "/Library/**", "/opt/**"]
+NODE_LOCKS = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock"]
+PY_DEPS = ["requirements.txt", "pyproject.toml", "uv.lock", "Pipfile"]  # requirements*.txt は requirements.txt として記録
+VENV_PATHS = ["**/.venv", "**/venv", "**/.env", "**/env", "**/*-venv", "**/.venv-*"]
+ELECTRON_CACHES = ["~/Library/Application Support/**/Cache", "~/Library/Application Support/**/Code Cache",
+                   "~/Library/Application Support/**/GPUCache", "~/Library/Application Support/**/CachedData",
+                   "~/Library/Application Support/**/DawnGraphiteCache",
+                   "~/Library/Application Support/**/DawnWebGPUCache"]
 
 RULES = [
     # ---- 開発系（プロジェクトの成果物） ----
-    dict(id="dev-node-modules", name="node_modules", safety="regen", regen="npm/pnpm install で再生成",
-         action="trash", paths=["**/node_modules"], sibling=["package.json"], stale_days=30, exclude=TOOL_AREAS),
-    dict(id="dev-venv", name="Python 仮想環境", safety="regen", regen="uv sync / pip install で再作成",
-         action="trash", paths=["**/.venv", "**/venv", "**/.env", "**/env", "**/*-venv", "**/.venv-*"],
-         child=["pyvenv.cfg"], stale_days=30, exclude=TOOL_AREAS),
+    # 再構築の根拠（package.json＋lockfile・依存定義）が揃うものだけ regen。欠けるものは直後の *-unsure（review）へ
+    dict(id="dev-node-modules", name="node_modules", safety="regen", regen="npm/pnpm install で再生成（lockfile あり）",
+         action="trash", paths=["**/node_modules"], sibling=["package.json"], sibling_also=NODE_LOCKS,
+         stale_days=30, exclude=TOOL_AREAS),
+    dict(id="dev-node-modules-unsure", name="node_modules（lockfile 無し）", safety="review",
+         regen="install で戻るが、lockfile が無いので同じ版になる保証がない",
+         action="trash", paths=["**/node_modules"], stale_days=30, exclude=TOOL_AREAS),
+    dict(id="dev-venv", name="Python 仮想環境", safety="regen", regen="uv sync / pip install で再作成（依存定義あり）",
+         action="trash", paths=VENV_PATHS, child=["pyvenv.cfg"], sibling=PY_DEPS, stale_days=30, exclude=TOOL_AREAS),
+    dict(id="dev-venv-unsure", name="Python 仮想環境（依存定義が隣に無い）", safety="review",
+         regen="中身を作り直す手がかり（requirements 等）が隣に無い",
+         action="trash", paths=VENV_PATHS, child=["pyvenv.cfg"], stale_days=30, exclude=TOOL_AREAS),
     dict(id="dev-pycache", name="__pycache__", safety="regen", regen="実行時に自動生成",
          action="trash", paths=["**/__pycache__", "**/.pytest_cache", "**/.mypy_cache", "**/.ruff_cache"],
          exclude=TOOL_AREAS),
     dict(id="dev-next", name="Next.js ビルド(.next)", safety="regen", regen="next build / dev で再生成",
-         action="trash", paths=["**/.next"], stale_days=30, exclude=TOOL_AREAS),
+         action="trash", paths=["**/.next"], sibling=["package.json"], stale_days=30, exclude=TOOL_AREAS),
     dict(id="dev-turbo", name="Turborepo キャッシュ", safety="regen", regen="turbo 実行時に再生成",
-         action="trash", paths=["**/.turbo"], stale_days=30, exclude=TOOL_AREAS),
+         action="trash", paths=["**/.turbo"], sibling=["package.json"], stale_days=30, exclude=TOOL_AREAS),
     dict(id="dev-parcel", name="Parcel キャッシュ", safety="regen", regen="parcel 実行時に再生成",
-         action="trash", paths=["**/.parcel-cache"], stale_days=30, exclude=TOOL_AREAS),
+         action="trash", paths=["**/.parcel-cache"], sibling=["package.json"], stale_days=30, exclude=TOOL_AREAS),
+    dict(id="dev-build-unsure", name="ビルドキャッシュ（隣に package.json が無い）", safety="review",
+         regen="どのプロジェクトの成果物か確認できない",
+         action="trash", paths=["**/.next", "**/.turbo", "**/.parcel-cache"], stale_days=30, exclude=TOOL_AREAS),
     dict(id="dev-rust-target", name="Rust target", safety="regen", regen="cargo build で再生成",
          action="trash", paths=["**/target"], sibling=["Cargo.toml"], stale_days=30, exclude=TOOL_AREAS),
     dict(id="dev-gradle-project", name="Gradle プロジェクトキャッシュ", safety="regen", regen="gradle 実行時に再生成",
@@ -66,11 +86,13 @@ RULES = [
     dict(id="pkg-pnpm", name="pnpm ストア", safety="review",
          regen="pnpm install で再取得（store を参照しているプロジェクトは再 install が要ることがある）",
          action="trash", paths=["~/Library/pnpm/store", "~/.local/share/pnpm/store", "~/.pnpm-store"]),
-    dict(id="pkg-yarn", name="Yarn キャッシュ", safety="regen", regen="yarn が必要時に再取得",
+    dict(id="pkg-yarn", name="Yarn キャッシュ", safety="review",
+         regen="yarn が再取得（Yarn Berry の offline cache はリポジトリ側が参照していることがある）",
          action="trash", paths=["~/Library/Caches/Yarn", "~/.yarn/berry/cache"]),
     dict(id="pkg-pip", name="pip キャッシュ", safety="regen", regen="pip が必要時に再取得",
          action="trash", paths=["~/Library/Caches/pip", "~/.cache/pip"]),
-    dict(id="pkg-uv", name="uv キャッシュ", safety="regen", regen="uv が必要時に再取得",
+    dict(id="pkg-uv", name="uv キャッシュ", safety="review",
+         regen="uv が再取得（uv が入れた Python 本体や venv がキャッシュを参照していることがある）",
          action="trash", paths=["~/.cache/uv"]),
     dict(id="pkg-go", name="Go モジュールキャッシュ", safety="regen", regen="go build で再取得",
          action="trash", paths=["~/go/pkg/mod"]),
@@ -92,13 +114,15 @@ RULES = [
          action="trash", paths=["~/.lmstudio/models", "~/.cache/lm-studio/models"]),
 
     # ---- アプリのキャッシュ・ログ ----
+    # Service Worker の CacheStorage はサイトのオフラインデータを持つことがあるので review
+    dict(id="app-sw-cache", name="Service Worker の CacheStorage", safety="review",
+         regen="サイトのオフライン用データを含むことがある",
+         action="trash", paths=["~/Library/Application Support/**/Service Worker/CacheStorage"]),
+    # 同じ階層に Chromium/Electron のプロファイルの印（Preferences・Local State）がある時だけ regen
     dict(id="app-electron-cache", name="アプリ内キャッシュ(Electron/Chromium)", safety="regen",
-         regen="アプリ起動時に再生成",
-         action="trash", paths=["~/Library/Application Support/**/Cache", "~/Library/Application Support/**/Code Cache",
-                                "~/Library/Application Support/**/GPUCache", "~/Library/Application Support/**/CachedData",
-                                "~/Library/Application Support/**/Service Worker/CacheStorage",
-                                "~/Library/Application Support/**/DawnGraphiteCache",
-                                "~/Library/Application Support/**/DawnWebGPUCache"]),
+         regen="アプリ起動時に再生成", action="trash", paths=ELECTRON_CACHES, sibling=["Preferences", "Local State"]),
+    dict(id="app-cache-unsure", name="アプリ内の Cache という名前のフォルダ（Chromium の印なし）", safety="review",
+         regen="名前は Cache だが、再生成されるキャッシュか確認できない", action="trash", paths=ELECTRON_CACHES),
     dict(id="app-container-caches", name="サンドボックスアプリのキャッシュ", safety="regen", regen="アプリが再生成",
          action="trash", paths=["~/Library/Containers/*/Data/Library/Caches/*"]),
     # app-caches より前に置く（同じ階層では先に書いた規則が勝つ）
@@ -107,11 +131,9 @@ RULES = [
          action="trash", paths=["~/Library/Caches/ms-playwright"]),
     dict(id="app-caches", name="~/Library/Caches", safety="regen", regen="アプリが再生成",
          action="trash", paths=["~/Library/Caches/*"]),
-    dict(id="app-logs", name="ログ", safety="regen", regen="アプリが再生成",
-         action="trash", paths=["~/Library/Logs/*"]),
 
     # ---- この Mac の実測で追加（2026-10-12） ----
-    dict(id="chrome-sign-clones", name="Chrome のコード署名用クローン", safety="review",
+    dict(id="chrome-sign-clones", name="Chrome のコード署名用クローン", safety="review", note="Chrome を終了してから",
          regen="Chrome が起動・更新時に作る一時コピー。溜まり続ける既知の不具合あり。Chrome を終了してから消す。"
                "APFS クローンなので実際に空く量は表示より小さいことがある",
          action="trash", paths=["/private/var/folders/*/*/X/com.google.Chrome.code_sign_clone/*"]),
@@ -120,13 +142,10 @@ RULES = [
          regen="macOS が再生成する想定（未確認）", action="trash", paths=["/private/var/folders/*/*/C/com.apple.*"]),
     dict(id="user-cache-dir", name="本人用の一時キャッシュ(/var/folders/…/C)", safety="regen", regen="各アプリ・コンパイラが再生成",
          action="trash", paths=["/private/var/folders/*/*/C/*"]),
-    # 自動で再取得されるか確認できていないもの（ツールの実行環境・手で落としたモデルの可能性）
-    dict(id="xdg-cache-unsure", name="~/.cache の再生成が未確認なもの", safety="review",
-         regen="ツールが再取得する想定（未確認）", action="trash",
-         paths=["~/.cache/codex-runtimes", "~/.cache/moss-models"]),
-    dict(id="xdg-cache", name="~/.cache", safety="regen", regen="各ツールが再取得・再生成",
+    # ~/.cache はツールの実行環境・手で落としたモデル等も置かれ、自動で再取得されるか分からないので全体を review
+    dict(id="xdg-cache", name="~/.cache", safety="review", regen="各ツールが再取得する想定（ツールごとに未確認）",
          action="trash", paths=["~/.cache/*"], exclude=["~/.cache/lm-studio"]),
-    dict(id="claude-vm-bundle", name="Claude デスクトップの VM イメージ", safety="review",
+    dict(id="claude-vm-bundle", name="Claude デスクトップの VM イメージ", safety="review", note="Claude アプリ使用中は消さない",
          regen="Claude アプリが再ダウンロード（アプリ使用中は消さない）",
          action="trash", paths=["~/Library/Application Support/Claude/vm_bundles/*"]),
     dict(id="chrome-ondevice-model", name="Chrome のオンデバイス AI モデル", safety="review", regen="Chrome が必要時に再ダウンロード",
@@ -139,6 +158,10 @@ RULES = [
          action="trash", paths=["~/Library/Python/*"]),
     dict(id="big-log-files", name="大きなログファイル", safety="review", regen="自作ツールの記録・データの可能性がある",
          action="trash", kind="file", paths=["~/Library/Logs/*", "~/Library/Logs/*/*"]),
+    # big-log-files より後ろ（ログフォルダ内の大きな記録ファイルは big-log-files が先に取る）。
+    # ~/Library/Logs には自作ツールの記録も置かれるので review
+    dict(id="app-logs", name="ログ", safety="review", regen="アプリが再生成（自作ツールの記録が混ざることがある）",
+         action="trash", paths=["~/Library/Logs/*"]),
     dict(id="apps", name="インストール済みアプリ", safety="review", regen="App Store・配布元から再インストール",
          action="info:使わないアプリは本人が Finder でゴミ箱へ（一括では扱わない）", paths=["/Applications/*.app", "/Applications/*/*.app", "~/Applications/*.app"]),
     dict(id="homebrew", name="Homebrew の導入済みパッケージ", safety="review", regen="brew install で再導入",
@@ -234,6 +257,8 @@ class Rule:
         self.kind = d.get("kind", "dir")
         self.child = d.get("child")
         self.sibling = d.get("sibling")
+        self.sibling_also = d.get("sibling_also")
+        self.note = d.get("note", "")
         self.min_age_days = d.get("min_age_days")
         self.stale_days = d.get("stale_days")
         self.container = d.get("container", False)
@@ -251,7 +276,7 @@ class Rule:
 
     def to_dict(self):
         return {"id": self.id, "name": self.name, "safety": self.safety, "regen": self.regen,
-                "action": self.action, "paths": self.patterns}
+                "action": self.action, "paths": self.patterns, "note": self.note}
 
 
 class RuleSet:

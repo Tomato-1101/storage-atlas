@@ -7,8 +7,10 @@ import time
 SF_DATALESS = 0x40000000  # iCloud 等のクラウド専用（ローカルに実体なし）
 BIG_FILE = 20 * 1024 ** 2
 
-# 規則の「隣接ファイル条件」用に、ディレクトリ直下にあれば名前だけ記録する
+# 規則の「隣接ファイル条件」用に、ディレクトリ直下にあれば名前だけ記録する（通常ファイルのみ。.git は種類を問わない）
 MARKERS = frozenset({
+    "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock",
+    "uv.lock", "Pipfile", "Preferences", "Local State",
     "Cargo.toml", "Package.swift", "pyvenv.cfg", "package.json", "pyproject.toml",
     "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
     "Podfile", "go.mod", "pom.xml", "Gemfile", "CMakeLists.txt", "Makefile",
@@ -18,7 +20,17 @@ MARKERS = frozenset({
 })
 
 # dirs の各列（scan 結果・索引の両方で使う）
-D_PATH, D_PARENT, D_DEPTH, D_SALLOC, D_SFILES, D_SMTIME, D_SCLOUD, D_MARK, D_TALLOC, D_TFILES, D_TMTIME, D_TCLOUD = range(12)
+(D_PATH, D_PARENT, D_DEPTH, D_SALLOC, D_SFILES, D_SMTIME, D_SCLOUD, D_MARK, D_TALLOC, D_TFILES, D_TMTIME, D_TCLOUD,
+ D_DEV, D_INO) = range(14)
+
+
+def marker_of(name):
+    """マーカーとして記録する名前（requirements-dev.txt 等は requirements.txt にまとめる）。対象外は None。"""
+    if name in MARKERS:
+        return name
+    if name.startswith("requirements") and name.endswith(".txt"):
+        return "requirements.txt"
+    return None
 
 
 def normalize_roots(roots):
@@ -47,6 +59,7 @@ def scan(roots, big=BIG_FILE, progress=True):
     nfiles = 0
     next_report = 100_000
     S_ISDIR = stat.S_ISDIR
+    S_ISREG = stat.S_ISREG
 
     for root in normalize_roots(roots):
         try:
@@ -55,9 +68,9 @@ def scan(roots, big=BIG_FILE, progress=True):
             errors.append(root)
             continue
         dev = rst.st_dev
-        stack = [(root, None, 0, rst.st_blocks * 512)]
+        stack = [(root, None, 0, rst.st_blocks * 512, rst.st_ino)]
         while stack:
-            path, parent, depth, dalloc = stack.pop()
+            path, parent, depth, dalloc, dino = stack.pop()
             idx = len(dirs)
             salloc = dalloc
             sfiles = 0
@@ -68,25 +81,27 @@ def scan(roots, big=BIG_FILE, progress=True):
                 it = os.scandir(path)
             except OSError:
                 errors.append(path)
-                dirs.append([path, parent, depth, salloc, 0, smtime, 0, None, 0, 0, 0, 0])
+                dirs.append([path, parent, depth, salloc, 0, smtime, 0, None, 0, 0, 0, 0, dev, dino])
                 continue
             with it:
                 for e in it:
                     name = e.name
-                    if name in MARKERS:
-                        if marks is None:
-                            marks = set()
-                        marks.add(name)
                     try:
                         st = e.stat(follow_symlinks=False)
                     except OSError:
                         stat_errors += 1
                         continue
+                    # 名前だけで判定しない（Cargo.toml という名前のディレクトリやリンクを根拠にしない）
+                    if name in MARKERS or (name[:12] == "requirements" and name[-4:] == ".txt"):
+                        if S_ISREG(st.st_mode) or name == ".git":
+                            if marks is None:
+                                marks = set()
+                            marks.add(marker_of(name))
                     if S_ISDIR(st.st_mode):
                         if st.st_dev != dev:
                             mounts.append(e.path)
                             continue
-                        stack.append((e.path, idx, depth + 1, st.st_blocks * 512))
+                        stack.append((e.path, idx, depth + 1, st.st_blocks * 512, st.st_ino))
                         continue
                     if st.st_nlink > 1:
                         key = (st.st_dev, st.st_ino)
@@ -106,7 +121,7 @@ def scan(roots, big=BIG_FILE, progress=True):
                         files.append((e.path, idx, a, st.st_size, mt, 1 if dataless else 0, st.st_dev, st.st_ino))
             nfiles += sfiles
             dirs.append([path, parent, depth, salloc, sfiles, smtime, scloud,
-                         ",".join(sorted(marks)) if marks else None, 0, 0, 0, 0])
+                         ",".join(sorted(marks)) if marks else None, 0, 0, 0, 0, dev, dino])
             if progress and nfiles >= next_report:
                 print(f"  {nfiles:,} ファイル / {len(dirs):,} ディレクトリ / {time.time() - t0:.0f}s  {path[:80]}",
                       file=sys.stderr, flush=True)

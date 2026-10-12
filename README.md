@@ -16,8 +16,10 @@ bin/stor find --min 1G --older 180d --ext mov,mp4
 bin/stor diff                 # 前回走査からの増減
 bin/stor dups --min 50M       # 重複ファイル（ここだけ中身を読む）
 bin/stor clean dev-node-modules --stale        # 既定は dry-run（何も動かさない）
-bin/stor clean dev-node-modules --stale --yes  # ゴミ箱へ移動して actions.jsonl に記録
+bin/stor clean dev-node-modules --stale --yes  # ゴミ箱へ移動して actions.jsonl に記録（索引が 24 時間より古いと拒否）
 ```
+
+ゴミ箱へ移すだけなので、ゴミ箱を空にするまで空き容量は増えない。表示サイズは索引上の値。
 
 全コマンド `--json` 対応。
 
@@ -27,8 +29,12 @@ bin/stor clean dev-node-modules --stale --yes  # ゴミ箱へ移動して action
   完全削除なので実行せず、案内（info）として表示するだけ。ゴミ箱も空にしない。
 - `clean` は `--yes` が無ければ dry-run（件数・合計・対象パス全件を表示）。`--yes` でも同じ一覧を
   `~/.local/share/stor/actions.jsonl` に残してから実行する。
-- 対象は regen/review の trash 規則に当たったものだけ（未分類のパスは拒否）。実行直前に毎回、実在・リンクでない・
-  マウントポイントでない・いまも同じ規則に当たる・索引時から 2 倍超に増えていない、を確かめて外れたらスキップ。
+- 対象は regen/review の trash 規則に当たったものだけ（未分類・索引に無いパスは拒否）。dry-run の一覧作成時と、
+  各対象をゴミ箱へ移す直前の両方で、同じ全チェックをやり直す: 拒否リスト・実在・リンクでない（途中も）・
+  マウントポイントでない・索引時と同じもの（dev/inode/種類）・いまも同じ規則に当たる（根拠ファイルは通常ファイルのみ）・
+  `--stale` ならいまも放置・配下に `.git`／マウント／personal 区域／別の review・personal 規則の対象が無い・
+  サイズを最後まで測れて索引時から 2 倍超に増えていない。外れたら拒否かスキップして理由を出す。
+- 全対象の結果（移動・拒否・スキップ・失敗）を actions.jsonl に 1 件ずつ残す。
 - 拒否リスト: `/` 直下・`/System`・`/Applications` 直下のアプリ・`~` とホーム直下・`~/Library` 等そのもの・
   `.git` とリポジトリのルート・personal 区域・ホームと既定 root の外。
 - 索引・履歴はリポジトリ外の `~/.local/share/stor/`（`STOR_HOME` で変更可）。パス一覧は個人情報なのでコミットしない。
@@ -38,6 +44,13 @@ bin/stor clean dev-node-modules --stale --yes  # ゴミ箱へ移動して action
 
 `storatlas/rules.py` の `RULES` に追記するだけ（再走査不要。索引から再判定される）。
 区分は `regen`（自動で再生成）/ `review`（本人判断）/ `personal`（本人データ）。迷ったら `review`。
+
+- プロジェクト成果物は再構築の根拠があるものだけ regen（node_modules は package.json＋lockfile、venv は隣に
+  requirements*.txt / pyproject.toml / uv.lock / Pipfile、.next 等は隣に package.json）。無いものは `*-unsure`（review）。
+- `~/Library/Application Support/**/Cache` 等は、同じ階層に Chromium/Electron の印（Preferences・Local State）が
+  ある時だけ regen。Service Worker の CacheStorage・`~/.cache`・uv・Yarn・`~/Library/Logs` は review。
+- `~/Library/Caches`・サンドボックスアプリの `Data/Library/Caches`・`/var/folders/…/C` は regen のまま。
+  Apple のガイドラインで「アプリが再生成できるものだけを置く場所」とされているため。
 
 ## テスト
 

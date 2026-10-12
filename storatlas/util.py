@@ -26,6 +26,27 @@ def tilde(path):
     return path
 
 
+_MD = {"\\": "\\\\", "`": "\\`", "*": "\\*", "[": "\\[", "]": "\\]", "<": "\\<", ">": "\\>", "|": "\\|"}
+_CTRL = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def esc(text):
+    """表示用に一行化・Markdown 記号を無効化する（ファイル名の改行や `#` 行で出力の構造を偽装させない）。"""
+    out = []
+    for c in text:
+        o = ord(c)
+        if o < 32 or 127 <= o < 160 or c in "\u2028\u2029":
+            out.append(_CTRL.get(c, f"\\x{o:02x}"))
+        else:
+            out.append(_MD.get(c, c))
+    return "".join(out)
+
+
+def disp(path):
+    """表示用のパス（~ 表記＋エスケープ）。"""
+    return esc(tilde(path))
+
+
 def norm(path):
     """利用者が渡したパスを索引のキー形式（絶対パス、末尾 / なし、シンボリックリンクは辿らない）にする。"""
     p = os.path.abspath(os.path.expanduser(path))

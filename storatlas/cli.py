@@ -12,7 +12,7 @@ from .report import build, growth, render_budget
 from .rules import RuleSet
 from .scanner import D_PARENT, D_PATH, D_TALLOC, D_TFILES, scan
 
-T = util.tilde
+T = util.disp
 H = util.human
 
 
@@ -94,7 +94,7 @@ def cmd_tree(args):
     walk(start, 0)
     lines = []
     for r in rows:
-        name = T(r["path"]) if r["depth"] == 0 else r["path"].rsplit("/", 1)[-1]
+        name = T(r["path"]) if r["depth"] == 0 else util.esc(r["path"].rsplit("/", 1)[-1])
         i = res.by_path[r["path"]]
         lines.append(f"{'  ' * r['depth']}{name} {H(r['alloc'])} {r['files']:,}件 {_tag_text(res, i)}".rstrip())
     _emit(args, rows, "\n".join(lines))
@@ -151,11 +151,15 @@ def cmd_diff(args):
         _emit(args, None, "前回の走査がないので比較できない（2 回目の `stor scan` 以降に使える）")
         return
     n = args.top
-    lines = [f"{util.fmt_time(g['from'])} → {util.fmt_time(g['to'])}", "## 増加"]
+    lines = [f"{util.fmt_time(g['from'])} → {util.fmt_time(g['to'])}（索引の保存先 {T(util.stor_home())} は除外）"]
+    if g["roots_changed"]:
+        lines.append("> 注意: 前回と走査した root の構成が違う。増減には root の差が含まれる")
+    lines.append("## 増加")
     lines += [f"- +{H(dd)} {T(p)}（現在 {H(c)}）" for p, dd, c in g["up"][:n]] or ["- なし"]
     lines.append("## 減少")
     lines += [f"- {H(dd)} {T(p)}（現在 {H(c)}）" for p, dd, c in g["down"][:n]] or ["- なし"]
-    _emit(args, {"from": g["from"], "to": g["to"], "up": g["up"][:n], "down": g["down"][:n]}, "\n".join(lines))
+    _emit(args, {"from": g["from"], "to": g["to"], "roots_changed": g["roots_changed"], "up": g["up"][:n],
+                 "down": g["down"][:n]}, "\n".join(lines))
 
 
 def cmd_rules(args):
@@ -176,29 +180,45 @@ def cmd_rules(args):
 
 def cmd_clean(args):
     con = db.connect(must_exist=True)
-    rs, res = _load(con)
-    items = clean_mod.plan(res, rs, args.targets, stale_only=args.stale)
-    # dry-run でも実行直前と同じ再判定をかけ、--yes と同じ一覧を見せる
-    clean_mod.verify(items, rs)
+    snap = db.latest(con)
+    age = time.time() - snap["started"]
+    if args.yes and age > clean_mod.INDEX_MAX_AGE:
+        raise SystemExit(f"索引が 24 時間より古い（{util.age_text(age)}前）ので --yes は受け付けない。"
+                         "`stor scan` してから dry-run で一覧を確認し、もう一度実行する")
+    rs = RuleSet()
+    files = db.load_files(con)
+    res = classify(db.load_dirs(con), files, rs)
+    ctx = clean_mod.Ctx(res, rs, files, stale=args.stale)
+    items = clean_mod.plan(ctx, args.targets, stale_only=args.stale)
+    # dry-run でも移動直前と同じ全チェックをかけ、--yes と同じ一覧を見せる
+    clean_mod.verify(items, ctx)
     ok = [it for it in items if it["status"] == "ok"]
     count, total = len(ok), sum(it["size"] for it in ok)
-    if args.yes:
-        clean_mod.execute(items)
+    warns = clean_mod.execute(items, ctx) if args.yes else []
     lines = []
     for it in items:
-        if it["status"] in ("refused", "skip"):
-            lines.append(f"- [{'拒否' if it['status'] == 'refused' else 'スキップ'}] {T(it['target'])}: {it['reason']}")
+        st = it["status"]
+        if st in ("refused", "skip"):
+            lines.append(f"- [{'拒否' if st == 'refused' else 'スキップ'}] {T(it['target'])}: {it['reason']}")
+        elif st == "error":
+            lines.append(f"- [失敗 rc={it.get('rc')}] {T(it['target'])}: {util.esc(it.get('stderr', '').strip())}")
         else:
-            lines.append(f"- [{it['status']}] trash {T(it['target'])} {H(it.get('size', 0))}（{it['rule']}）")
+            lines.append(f"- [{st}] trash {T(it['target'])} {H(it.get('size', 0))}（{it['rule']}）")
+    head = [f"索引 {util.fmt_time(snap['started'])}（{util.age_text(age)}前）。サイズは索引上の値"]
     if args.yes:
         done = sum(1 for it in items if it["status"] == "done")
         err = sum(1 for it in items if it["status"] == "error")
-        lines.insert(0, f"実行: 対象 {count} 件 {H(total)} → 成功 {done} / 失敗 {err}"
-                        f"（記録: {util.stor_home()}/actions.jsonl。ゴミ箱から戻せる。索引は `stor scan` で更新）")
+        head.append(f"実行: 対象 {count} 件 {H(total)} → ゴミ箱へ移動 {done} / 失敗 {err}"
+                    f"（記録: {T(util.stor_home())}/actions.jsonl。ゴミ箱から戻せる。索引は `stor scan` で更新）")
+        head.append("ゴミ箱を空にするまで空き容量は増えない（stor は空にしない）")
+        if warns:
+            head.append(f"> 警告: actions.jsonl への記録に失敗 {len(warns)} 件（移動は下の一覧のとおり）: "
+                        + " / ".join(warns[:3]))
     else:
-        lines.insert(0, f"dry-run（何も動かしていない）: 対象 {count} 件 {H(total)}（ゴミ箱へ移動）。実行は --yes")
-    _emit(args, {"mode": "yes" if args.yes else "dry-run", "count": count, "total": total, "items": items},
-          "\n".join(lines))
+        head.append(f"dry-run（何も動かしていない）: 対象 {count} 件 {H(total)}（ゴミ箱へ移動。"
+                    "ゴミ箱を空にするまで空き容量は増えない）。実行は --yes")
+    _emit(args, {"mode": "yes" if args.yes else "dry-run", "index_time": snap["started"], "count": count,
+                 "total": total, "warnings": warns, "items": items}, "\n".join(head + lines))
     if any(it["status"] == "error" for it in items):
         sys.exit(1)
 
@@ -252,4 +272,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_rules)
 
     args = ap.parse_args(argv)
-    args.fn(args)
+    n = len(db._OPEN)
+    try:
+        args.fn(args)
+    finally:
+        db.close_since(n)
