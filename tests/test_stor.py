@@ -673,6 +673,22 @@ class StorTest(unittest.TestCase):
         self.assertEqual(clean_mod.in_use(t, procs + [(8, 1, f"node {t}/.bin/next dev")])[0], 8)
         self.assertEqual(clean_mod.in_use(t, procs + [(9, 1, f"rm-me {t}")])[0], 9)
 
+    def test_busy_app_skipped(self):
+        vm = f"{self.home}/Library/Application Support/Claude/vm_bundles/claudevm.bundle"
+        os.makedirs(vm)
+        with open(f"{vm}/disk.img", "wb") as f:
+            f.write(b"x" * 4096)
+        self.do_scan()
+        # 実機のプロセス一覧に左右されないよう ps の結果を差し替える
+        idle = [(1, 0, "/sbin/launchd")]
+        with mock.patch.object(util, "processes", return_value=idle):
+            self.assertEqual(self.item(self.clean_json("claude-vm-bundle"), vm)["status"], "ok")
+        busy = idle + [(5, 1, "/Applications/Claude.app/Contents/MacOS/Claude")]
+        with mock.patch.object(util, "processes", return_value=busy):
+            it = self.item(self.clean_json("claude-vm-bundle"), vm)
+        self.assertEqual(it["status"], "skip", it)
+        self.assertIn("アプリ起動中", it["reason"])
+
     def test_s4_old_index_rejected_and_migrated_only_by_scan(self):
         import sqlite3
         os.makedirs(os.environ["STOR_HOME"])

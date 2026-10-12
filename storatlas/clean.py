@@ -391,6 +391,10 @@ def check(it, ctx):
     u = in_use(t, ctx.procs)
     if u:
         return "skip", f"使用中（pid {u[0]} {util.esc(u[1][:80])}）"
+    # VM イメージ等はパスを引数に持たずアプリが開くので、アプリ自体が起動中なら動かさない
+    app = ctx.rs.by_id[it["rule"]].busy_app if it.get("rule") in ctx.rs.by_id else None
+    if app and any(app in cmd for _, _, cmd in ctx.procs):
+        return "skip", f"アプリ起動中（{app.strip('/').split('/')[0]}）。終了してから"
     # 走査・放置判定の間に差し替わっていないか、移す直前にもう一度確かめる
     bad = _identity(t, it)
     if bad:

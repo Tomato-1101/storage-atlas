@@ -9,7 +9,7 @@ container=True の規則は「区域」で、配下で他の規則に当たっ�
   child(このディレクトリ直下にどれかがあること), sibling(親ディレクトリ直下にどれかがあること),
   sibling_also(sibling に加えて、親ディレクトリ直下にこのどれかもあること。再構築の根拠＝lockfile 等),
   （child・sibling 系の判定に使うのは通常ファイルだけ。.git は種類を問わない）
-  note(report に出す注意事項),
+  note(report に出す注意事項), busy_app(このアプリの実行ファイルを含むプロセスが動いていれば clean しない),
   min_age_days(最終更新がこれより古いものだけ), stale_days(親=プロジェクトの最終更新がこれより古ければ「放置」と強調),
   exclude(この glob に当たるパスでは適用しない)
 action: "trash"（/usr/bin/trash でゴミ箱へ）/ "info:<案内文>"（表示するだけ。stor は動かさない）
@@ -134,6 +134,7 @@ RULES = [
 
     # ---- この Mac の実測で追加（2026-10-12） ----
     dict(id="chrome-sign-clones", name="Chrome のコード署名用クローン", safety="review", note="Chrome を終了してから",
+         busy_app="/Google Chrome.app/Contents/",
          regen="Chrome が起動・更新時に作る一時コピー。溜まり続ける既知の不具合あり。Chrome を終了してから消す。"
                "APFS クローンなので実際に空く量は表示より小さいことがある",
          action="trash", paths=["/private/var/folders/*/*/X/com.google.Chrome.code_sign_clone/*"]),
@@ -146,6 +147,7 @@ RULES = [
     dict(id="xdg-cache", name="~/.cache", safety="review", regen="各ツールが再取得する想定（ツールごとに未確認）",
          action="trash", paths=["~/.cache/*"], exclude=["~/.cache/lm-studio"]),
     dict(id="claude-vm-bundle", name="Claude デスクトップの VM イメージ", safety="review", note="Claude アプリ使用中は消さない",
+         busy_app="/Claude.app/Contents/",
          regen="Claude アプリが再ダウンロード（アプリ使用中は消さない）",
          action="trash", paths=["~/Library/Application Support/Claude/vm_bundles/*"]),
     dict(id="chrome-ondevice-model", name="Chrome のオンデバイス AI モデル", safety="review", regen="Chrome が必要時に再ダウンロード",
@@ -259,6 +261,7 @@ class Rule:
         self.sibling = d.get("sibling")
         self.sibling_also = d.get("sibling_also")
         self.note = d.get("note", "")
+        self.busy_app = d.get("busy_app")
         self.min_age_days = d.get("min_age_days")
         self.stale_days = d.get("stale_days")
         self.container = d.get("container", False)
