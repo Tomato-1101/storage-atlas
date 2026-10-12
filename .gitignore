@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# 索引はリポ外（~/.local/share/stor）に置くが、誤って作られても入れない
+*.sqlite
+actions.jsonl
