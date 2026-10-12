@@ -1,6 +1,7 @@
 """一時ディレクトリの偽ツリーで、集計・ハードリンク・規則判定・stale 判定・dry-run・personal 拒否を確かめる。
 実データには一切触れない（HOME と STOR_HOME を一時ディレクトリに向ける。ゴミ箱も偽物に差し替える）。"""
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -201,31 +203,137 @@ class StorTest(unittest.TestCase):
         for target in ("personal-home", f"{h}/Documents", f"{h}/Documents/report.docx", h, f"{h}/Project/..",
                        "trash"):
             out = self.run_cli("clean", target, "--json")
-            items = json.loads(out)
+            items = json.loads(out)["items"]
             self.assertTrue(all(it["status"] in ("refused", "skip") for it in items), (target, items))
         before = self.all_paths()
         self.run_cli("clean", "personal-home", f"{h}/Documents/report.docx", "--yes")
         self.assertEqual(before, self.all_paths())
 
-    def test_execute_with_fake_trash(self):
-        self.do_scan()
+    def use_fake_trash(self):
+        """/usr/bin/trash の代わりに、一時ディレクトリの偽ゴミ箱へ mv するスクリプトを使う。"""
         fake = os.path.join(self.tmp, "fake-trash.sh")
         with open(fake, "w") as f:
             f.write(f'#!/bin/sh\nfor p in "$@"; do d=$(mktemp -d "{self.fake_trash}/t.XXXXXX"); mv "$p" "$d/"; done\n')
         os.chmod(fake, os.stat(fake).st_mode | stat.S_IXUSR)
         orig = clean_mod.TRASH_BIN
         clean_mod.TRASH_BIN = fake
-        try:
-            out = self.run_cli("clean", "dev-node-modules", f"{self.home}/Documents/proj/node_modules", "--yes")
-        finally:
-            clean_mod.TRASH_BIN = orig
+        self.addCleanup(setattr, clean_mod, "TRASH_BIN", orig)
+
+    def clean_json(self, *argv):
+        return json.loads(self.run_cli("clean", *argv, "--json"))
+
+    def item(self, out, target):
+        return next(it for it in out["items"] if it["target"] == target)
+
+    def set_aside(self, path):
+        """テスト中の「消す」代わりに、偽ツリーの外（一時ディレクトリ内）へ退避する。"""
+        dst = os.path.join(self.tmp, "aside", os.path.basename(path))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.rename(path, dst)
+        return dst
+
+    def test_execute_with_fake_trash(self):
+        self.do_scan()
+        self.use_fake_trash()
+        dry = self.clean_json("dev-node-modules", f"{self.home}/Documents/proj/node_modules")
+        out = self.run_cli("clean", "dev-node-modules", f"{self.home}/Documents/proj/node_modules", "--yes")
         self.assertIn("実行", out)
         self.assertFalse(os.path.exists(f"{self.home}/Project/app/node_modules"))
         self.assertTrue(os.path.exists(f"{self.home}/Project/app/src/main.js"))
         self.assertTrue(os.path.exists(f"{self.home}/Documents/report.docx"))
         with open(os.path.join(os.environ["STOR_HOME"], "actions.jsonl")) as f:
             log = [json.loads(x) for x in f]
-        self.assertTrue(log and all({"time", "target", "size", "command", "rc", "result"} <= set(e) for e in log))
+        # 実行前に dry-run と同じ一覧（件数・合計・全パス）を plan として 1 レコード残す
+        self.assertEqual(log[0]["type"], "plan")
+        self.assertEqual(log[0]["count"], dry["count"])
+        self.assertEqual(log[0]["total"], dry["total"])
+        self.assertEqual(sorted(t["target"] for t in log[0]["targets"]),
+                         sorted(it["target"] for it in dry["items"] if it["status"] == "ok"))
+        trashed = [e for e in log[1:]]
+        self.assertTrue(trashed and all(e["type"] == "trash" and e["command"][0] == clean_mod.TRASH_BIN
+                                        and {"time", "target", "size", "rc", "result"} <= set(e) for e in trashed))
+
+    # ---- 不変条件 1 / 1a: 誤爆防止の多重チェック ----
+    def test_no_command_other_than_trash(self):
+        rs = RuleSet()
+        self.assertTrue(all(r.action_kind in ("trash", "info") for r in rs.rules))
+        src = inspect.getsource(clean_mod)
+        self.assertEqual(src.count("subprocess.run("), 1)
+        for word in ("shutil", "shlex", "os.remove", "unlink", "rmtree", '"cmd"'):
+            self.assertNotIn(word, src)
+
+    def test_unclassified_refused(self):
+        self.do_scan()
+        h = self.home
+        out = self.clean_json(f"{h}/data/a.bin", f"{h}/Project/notrust/target",
+                              f"{h}/Library/Application Support/Slack/settings.json")
+        for it in out["items"]:
+            self.assertEqual(it["status"], "refused", it)
+        self.assertIn("未分類", self.item(out, f"{h}/data/a.bin")["reason"])
+        self.assertEqual(out["count"], 0)
+
+    def test_deny_list(self):
+        h = self.home
+        put(f"{h}/Library/Caches/com.repo/.git/HEAD", 100)
+        put(f"{h}/Library/Caches/com.repo/blob", 5000)
+        put(f"{h}/package.json", 100)
+        put(f"{h}/node_modules/x.js", 5000)
+        self.do_scan()
+        out = self.clean_json("app-caches", "dev-node-modules", f"{h}/Library/Caches/com.repo/.git",
+                              f"{h}/Library", f"{h}/Library/Application Support")
+        self.assertIn("リポジトリのルート", self.item(out, f"{h}/Library/Caches/com.repo")["reason"])
+        self.assertIn(".git", self.item(out, f"{h}/Library/Caches/com.repo/.git")["reason"])
+        self.assertIn("ホーム直下", self.item(out, f"{h}/node_modules")["reason"])
+        self.assertIn("ホーム直下", self.item(out, f"{h}/Library")["reason"])
+        self.assertIn("そのもの", self.item(out, f"{h}/Library/Application Support")["reason"])
+        for p in (f"{h}/Library/Caches/com.repo", f"{h}/node_modules"):
+            self.assertEqual(self.item(out, p)["status"], "refused")
+        # 実ファイルシステムの拒否リスト（索引を使わない判定）
+        self.assertIn("/ 直下", clean_mod.deny_reason("/usr"))
+        self.assertIn("/System", clean_mod.deny_reason("/System/Library/Caches"))
+        self.assertIn("アプリ本体", clean_mod.deny_reason("/Applications/Foo.app"))
+        self.assertIn("上位", clean_mod.deny_reason(os.path.dirname(h)))
+        # ホームと既定 root の外
+        orig = clean_mod.allowed_roots
+        clean_mod.allowed_roots = lambda: [h]
+        self.addCleanup(setattr, clean_mod, "allowed_roots", orig)
+        self.assertIn("外", clean_mod.deny_reason(self.fake_trash + "/x"))
+        before = self.all_paths()
+        self.use_fake_trash()
+        self.run_cli("clean", "app-caches", "dev-node-modules", "--yes")
+        self.assertTrue(os.path.exists(f"{h}/Library/Caches/com.repo/.git/HEAD"))
+        self.assertTrue(os.path.exists(f"{h}/node_modules/x.js"))
+        self.assertFalse(os.path.exists(f"{h}/Library/Caches/com.example"))  # 正当な候補は動く
+        self.assertTrue(before - self.all_paths())
+
+    def test_symlink_and_mount_skipped(self):
+        self.do_scan()
+        h = self.home
+        real = self.set_aside(f"{h}/Project/app/node_modules")
+        os.symlink(real, f"{h}/Project/app/node_modules")
+        with mock.patch("os.path.ismount", lambda p: p == f"{h}/Project/rs/target"):
+            out = self.clean_json("dev-node-modules", "dev-rust-target")
+        self.assertIn("シンボリックリンク", self.item(out, f"{h}/Project/app/node_modules")["reason"])
+        self.assertIn("マウントポイント", self.item(out, f"{h}/Project/rs/target")["reason"])
+        self.assertEqual(self.item(out, f"{h}/Project/old/node_modules")["status"], "ok")
+
+    def test_rule_rematch_and_growth_skipped(self):
+        self.do_scan()
+        h = self.home
+        # 索引後に隣の package.json が無くなった → いまは dev-node-modules に当たらない
+        self.set_aside(f"{h}/Project/app/package.json")
+        # 索引後に 2 倍超に増えた
+        put(f"{h}/Project/old/node_modules/big.bin", 3 * util.MB)
+        self.use_fake_trash()
+        before = self.all_paths()
+        out = self.clean_json("dev-node-modules", "--yes")
+        self.assertEqual(self.item(out, f"{h}/Project/app/node_modules")["status"], "skip")
+        self.assertIn("当たらない", self.item(out, f"{h}/Project/app/node_modules")["reason"])
+        self.assertEqual(self.item(out, f"{h}/Project/old/node_modules")["status"], "skip")
+        self.assertIn("2 倍超", self.item(out, f"{h}/Project/old/node_modules")["reason"])
+        self.assertEqual(self.item(out, f"{h}/Documents/proj/node_modules")["status"], "done")
+        gone = before - self.all_paths()
+        self.assertTrue(all(p.startswith(f"{h}/Documents/proj/node_modules") for p in gone), gone)
 
     def test_report_diff_tree(self):
         orig = db.HIST_MIN

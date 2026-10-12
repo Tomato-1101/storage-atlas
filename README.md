@@ -23,9 +23,14 @@ bin/stor clean dev-node-modules --stale --yes  # ゴミ箱へ移動して action
 
 ## 安全のための決まり
 
-- 完全削除はしない。`/usr/bin/trash`（ゴミ箱へ移動）か公式コマンド（`brew cleanup -s` 等）だけ。ゴミ箱も空にしない。
-- `clean` は `--yes` が無ければ dry-run。実行した操作は `~/.local/share/stor/actions.jsonl` に追記。
-- `personal`（書類・写真・iCloud Drive 等）は clean できない。中にある既知のキャッシュ（node_modules 等）だけは対象。
+- 完全削除はしない。stor が動かす手段は `/usr/bin/trash`（ゴミ箱へ移動）だけ。`brew cleanup` 等の公式クリーンコマンドも
+  完全削除なので実行せず、案内（info）として表示するだけ。ゴミ箱も空にしない。
+- `clean` は `--yes` が無ければ dry-run（件数・合計・対象パス全件を表示）。`--yes` でも同じ一覧を
+  `~/.local/share/stor/actions.jsonl` に残してから実行する。
+- 対象は regen/review の trash 規則に当たったものだけ（未分類のパスは拒否）。実行直前に毎回、実在・リンクでない・
+  マウントポイントでない・いまも同じ規則に当たる・索引時から 2 倍超に増えていない、を確かめて外れたらスキップ。
+- 拒否リスト: `/` 直下・`/System`・`/Applications` 直下のアプリ・`~` とホーム直下・`~/Library` 等そのもの・
+  `.git` とリポジトリのルート・personal 区域・ホームと既定 root の外。
 - 索引・履歴はリポジトリ外の `~/.local/share/stor/`（`STOR_HOME` で変更可）。パス一覧は個人情報なのでコミットしない。
 - 走査は stat のみ。シンボリックリンクを辿らず、マウントポイントを跨がない。
 

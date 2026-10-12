@@ -97,7 +97,7 @@ def render(d, lim):
         if r["stale_count"]:
             line += f"（うち放置プロジェクト分 {H(r['stale_alloc'])}/{r['stale_count']}件 → `--stale`）"
         kind, _, arg = r["action"].partition(":")
-        line += f" → `stor clean {r['id']} --yes`" + (f"（= {arg}）" if kind == "cmd" else "")
+        line += f" → {arg}" if kind == "info" else f" → `stor clean {r['id']} --yes`（ゴミ箱へ）"
         L.append(line)
     if len(regen) > lim["regen"]:
         L.append(f"- 他 {len(regen) - lim['regen']} 規則 {H(sum(r['alloc'] for r in regen[lim['regen']:]))}（`stor rules`）")
@@ -107,7 +107,7 @@ def render(d, lim):
     for r in review[:lim["review"]]:
         tops = ", ".join(f"{T(p)} {H(a)}" for p, a in r["top"][:lim["review_top"]])
         kind, _, arg = r["action"].partition(":")
-        how = arg if kind == "hint" else (f"`stor clean {r['id']}`" + (f"（= {arg}）" if kind == "cmd" else ""))
+        how = arg if kind == "info" else f"`stor clean {r['id']}`（ゴミ箱へ）"
         L.append(f"- {r['id']}（{r['name']}）{H(r['alloc'])} {r['count']}件: {tops} ／ {how}")
     if len(review) > lim["review"]:
         L.append(f"- 他 {len(review) - lim['review']} 規則（`stor rules`）")

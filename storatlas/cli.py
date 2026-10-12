@@ -178,27 +178,27 @@ def cmd_clean(args):
     con = db.connect(must_exist=True)
     rs, res = _load(con)
     items = clean_mod.plan(res, rs, args.targets, stale_only=args.stale)
+    # dry-run でも実行直前と同じ再判定をかけ、--yes と同じ一覧を見せる
+    clean_mod.verify(items, rs)
+    ok = [it for it in items if it["status"] == "ok"]
+    count, total = len(ok), sum(it["size"] for it in ok)
     if args.yes:
         clean_mod.execute(items)
     lines = []
     for it in items:
-        size = H(it.get("size", 0))
         if it["status"] in ("refused", "skip"):
             lines.append(f"- [{'拒否' if it['status'] == 'refused' else 'スキップ'}] {T(it['target'])}: {it['reason']}")
-        elif it["op"] == "cmd":
-            lines.append(f"- [{it['status']}] {it['target']} {size}: {' '.join(it['command'])}")
         else:
-            note = " ※未分類" if it.get("unclassified") else ""
-            lines.append(f"- [{it['status']}] trash {T(it['target'])} {size}{note}")
-    ok = [it for it in items if it["status"] in ("ok", "done")]
-    total = sum(it.get("size", 0) for it in ok)
+            lines.append(f"- [{it['status']}] trash {T(it['target'])} {H(it.get('size', 0))}（{it['rule']}）")
     if args.yes:
         done = sum(1 for it in items if it["status"] == "done")
         err = sum(1 for it in items if it["status"] == "error")
-        lines.insert(0, f"実行: 成功 {done} / 失敗 {err}（記録: {util.stor_home()}/actions.jsonl。索引は `stor scan` で更新）")
+        lines.insert(0, f"実行: 対象 {count} 件 {H(total)} → 成功 {done} / 失敗 {err}"
+                        f"（記録: {util.stor_home()}/actions.jsonl。ゴミ箱から戻せる。索引は `stor scan` で更新）")
     else:
-        lines.insert(0, f"dry-run（何も動かしていない）: 対象 {len(ok)} 件 {H(total)}。実行は --yes")
-    _emit(args, items, "\n".join(lines))
+        lines.insert(0, f"dry-run（何も動かしていない）: 対象 {count} 件 {H(total)}（ゴミ箱へ移動）。実行は --yes")
+    _emit(args, {"mode": "yes" if args.yes else "dry-run", "count": count, "total": total, "items": items},
+          "\n".join(lines))
     if any(it["status"] == "error" for it in items):
         sys.exit(1)
 
