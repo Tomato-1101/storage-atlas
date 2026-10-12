@@ -34,7 +34,7 @@ def cmd_scan(args):
     res = scan(roots, progress=not args.quiet)
     df = util.disk_usage()
     snaps = util.local_snapshot_count()
-    con = db.connect()
+    con = db.connect(for_scan=True)
     sid = db.save_scan(con, res, df, snaps)
     total = sum(d[D_TALLOC] for d in res["dirs"] if d[D_PARENT] is None)
     obj = {"snapshot": sid, "roots": res["roots"], "files": res["nfiles"], "dirs": len(res["dirs"]),
@@ -172,7 +172,8 @@ def cmd_rules(args):
         a = agg.get(r.id, {"alloc": 0, "count": 0, "stale_alloc": 0})
         out.append({**r.to_dict(), "alloc": a["alloc"], "count": a["count"], "stale_alloc": a["stale_alloc"]})
         stale = f"（放置 {H(a['stale_alloc'])}）" if a["stale_alloc"] else ""
-        lines.append(f"| {r.id} | {r.safety} | {r.name} | {H(a['alloc'])}{stale} | {a['count']} | {r.action} |")
+        note = f"［注意: {r.note}］" if r.note else ""
+        lines.append(f"| {r.id} | {r.safety} | {r.name} | {H(a['alloc'])}{stale} | {a['count']} | {r.action}{note} |")
     if not has_index:
         lines.append("\n（索引がないので該当量は 0。`stor scan` 後に再表示）")
     _emit(args, out, "\n".join(lines))
@@ -205,6 +206,10 @@ def cmd_clean(args):
         else:
             lines.append(f"- [{st}] trash {T(it['target'])} {H(it.get('size', 0))}（{it['rule']}）")
     head = [f"索引 {util.fmt_time(snap['started'])}（{util.age_text(age)}前）。サイズは索引上の値"]
+    # 規則の操作条件（「Chrome を終了してから」等）は report で省略されても、ここでは必ず出す
+    rids = [t for t in args.targets if t in rs.by_id] + [it["rule"] for it in items if it.get("rule")]
+    notes = {rid: rs.by_id[rid].note for rid in dict.fromkeys(rids) if rs.by_id[rid].note}
+    head += [f"> 注意（{rid}）: {n}" for rid, n in notes.items()]
     if args.yes:
         done = sum(1 for it in items if it["status"] == "done")
         err = sum(1 for it in items if it["status"] == "error")
@@ -218,7 +223,7 @@ def cmd_clean(args):
         head.append(f"dry-run（何も動かしていない）: 対象 {count} 件 {H(total)}（ゴミ箱へ移動。"
                     "ゴミ箱を空にするまで空き容量は増えない）。実行は --yes")
     _emit(args, {"mode": "yes" if args.yes else "dry-run", "index_time": snap["started"], "count": count,
-                 "total": total, "warnings": warns, "items": items}, "\n".join(head + lines))
+                 "total": total, "notes": notes, "warnings": warns, "items": items}, "\n".join(head + lines))
     if any(it["status"] == "error" for it in items):
         sys.exit(1)
 

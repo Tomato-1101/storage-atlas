@@ -153,3 +153,20 @@ def local_snapshot_count():
     except (OSError, subprocess.SubprocessError):
         return None
     return sum(1 for line in out.splitlines() if line.startswith("com.apple"))
+
+
+def processes():
+    """動いているプロセスの (pid, ppid, コマンドライン) の一覧（読み取りのみ）。取れなければ None。"""
+    try:
+        p = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,ppid=,command="], capture_output=True, text=True,
+                           errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    out = []
+    for line in p.stdout.splitlines():
+        f = line.split(None, 2)
+        if len(f) >= 2 and f[0].isdigit() and f[1].isdigit():
+            out.append((int(f[0]), int(f[1]), f[2] if len(f) > 2 else ""))
+    return out

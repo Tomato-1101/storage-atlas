@@ -8,13 +8,14 @@ import subprocess
 import time
 
 from . import util
-from .scanner import D_DEV, D_INO, D_TALLOC, marker_of
+from .scanner import BIG_FILE, D_DEV, D_INO, D_TALLOC, marker_of
 
 TRASH_BIN = "/usr/bin/trash"
 SIZE_FACTOR = 2           # 索引時からこの倍を超えて増えていたらスキップ
 SIZE_FLOOR = util.MB      # 小さいディレクトリはブロック単位の揺れで倍を超えるので下限を設ける
 SIZE_TIMEOUT = 120.0      # サイズ再計測・放置判定の走査の上限秒。測りきれなければスキップ
 INDEX_MAX_AGE = 86400     # これより古い索引では --yes を受け付けない
+FILE_RULE_MIN = BIG_FILE  # ファイル規則（big-log-files 等）は索引と同じく、この大きさ以上のファイルだけに当てる
 D = util.disp
 
 
@@ -80,6 +81,8 @@ class Ctx:
         self.protected = [(m.path, m.rule.id) for m in res.matches if m.rule.safety in ("personal", "review")]
         self.personal_rx = [rx for r in rs.rules if r.safety == "personal" for rx in r.regexes]
         self.artifacts = {m.path for m in res.matches if m.kind == "dir" and not m.rule.container}
+        self.procs = None        # ps の結果（dry-run は 1 回取って使い回す）
+        self.fresh_ps = False    # True なら対象ごとに取り直す（--yes の移動直前）
 
 
 def _refuse(target, reason, **kw):
@@ -202,27 +205,65 @@ def rule_now(rs, path, kind, now=None):
     return None
 
 
-def walk(path, limit, deadline, ctx):
+def sub_rule(rs, path, st, upto):
+    """配下の path に、対象の規則（順位 upto）より優先する review/personal 規則が当たるならその規則。
+    分類では親の規則が配下を丸ごと持つので、索引の matches には出てこない（索引後に増えた分も含めて実物で見る）。
+    同じ規則・regen 規則・後順位の規則（node_modules 内の node_modules 等）は見ない。区域規則は personal_rx で別に見る。"""
+    is_dir = stat.S_ISDIR(st.st_mode)
+    if is_dir:
+        cands = rs.dir_candidates(path)
+    elif st.st_blocks * 512 >= FILE_RULE_MIN or st.st_size >= FILE_RULE_MIN:
+        cands = [(r, rx) for r in rs.file_rules for rx in r.regexes]
+    else:
+        return None
+    for r, rx in cands:
+        if r.order >= upto or r.safety == "regen" or r.container or not rx.fullmatch(path):
+            continue
+        if r.child and not (is_dir and _markers_now(path) & set(r.child)):
+            continue
+        if r.sibling and not _markers_now(os.path.dirname(path)) & set(r.sibling):
+            continue
+        if r.sibling_also and not _markers_now(os.path.dirname(path)) & set(r.sibling_also):
+            continue
+        if r.min_age_days and time.time() - st.st_mtime < r.min_age_days * 86400:
+            continue
+        if r.excludes and any(x.fullmatch(path) for x in r.excludes):
+            continue
+        return r
+    return None
+
+
+def walk(path, limit, deadline, ctx, rule=None, ident=None):
     """対象の中を 1 回だけ走査し、サイズ（ハードリンクが 1 本だけのファイル）を測りながら、
-    中に残すべきもの（.git・マウント・personal 区域）が無いかを見る。
+    中に残すべきもの（.git・マウント・personal 区域・対象の規則より優先する review 規則の対象）が無いかを見る。
+    ident（dev, ino）を渡すと、走査の起点が索引時と同じものかも確かめる。
     戻り値: (合計, None) か (None, (status, 理由))。limit を超えた時点で打ち切る（その場合はスキップされる）。"""
     try:
         st = os.lstat(path)
     except OSError:
         return None, ("skip", "サイズ計測が不完全（読めない）")
+    if ident is not None and (st.st_dev, st.st_ino) != tuple(ident):
+        return None, ("skip", "索引時と別物（計測の開始時に inode が違う）。`stor scan` し直してから")
     if not stat.S_ISDIR(st.st_mode):
         return st.st_blocks * 512, None
     dev, total, stack = st.st_dev, st.st_blocks * 512, [path]
+    timeout = None, ("skip", "サイズ計測が時間切れ（不完全）")
     while stack:
         if time.time() > deadline:
-            return None, ("skip", "サイズ計測が時間切れ（不完全）")
+            return timeout
         d = stack.pop()
         try:
             with os.scandir(d) as it:
                 for e in it:
+                    if time.time() > deadline:
+                        return timeout
                     if e.name.casefold() == ".git":
                         return None, ("refused", f"配下に .git がある（{D(e.path)}）")
                     s = e.stat(follow_symlinks=False)
+                    if rule is not None:
+                        r = sub_rule(ctx.rs, e.path, s, rule.order)
+                        if r is not None:
+                            return None, ("refused", f"配下に別の規則（{r.id}・{r.safety}）の対象がある（{D(e.path)}）")
                     if stat.S_ISDIR(s.st_mode):
                         if s.st_dev != dev:
                             return None, ("refused", f"配下にマウントポイントがある（{D(e.path)}）")
@@ -236,6 +277,8 @@ def walk(path, limit, deadline, ctx):
             return None, ("skip", f"サイズ計測が不完全（読めない場所がある: {D(d)}）")
         if total > limit:
             return total, None
+    if time.time() > deadline:
+        return timeout
     return total, None
 
 
@@ -249,6 +292,8 @@ def project_mtime(proj, artifact, ctx, deadline):
         try:
             with os.scandir(d) as it:
                 for e in it:
+                    if time.time() > deadline:
+                        return None
                     if e.path == artifact or e.name.casefold() == ".git" or e.path in ctx.artifacts:
                         continue
                     s = e.stat(follow_symlinks=False)
@@ -258,15 +303,38 @@ def project_mtime(proj, artifact, ctx, deadline):
                         latest = s.st_mtime
         except OSError:
             return None
+    if time.time() > deadline:
+        return None
     return latest
 
 
-def check(it, ctx):
-    """1 件の全チェック。通れば None、外れれば (status, 理由)。dry-run と移動直前で同じものを使う。"""
-    t = it["target"]
-    why = deny_reason(t)
-    if why:
-        return "refused", why
+def in_use(target, procs):
+    """コマンドラインに target（完全一致か target/ で始まるパス）を含むプロセス (pid, コマンド)。無ければ None。
+    stor 自身とその祖先（stor を起動したシェル等。引数に対象パスを持つ）は除く。"""
+    parent = {pid: ppid for pid, ppid, _ in procs}
+    mine, p = set(), os.getpid()
+    while p and p not in mine:
+        mine.add(p)
+        p = parent.get(p)
+    ts = [target.casefold()]
+    if ts[0].startswith("/private/"):  # /var/folders 等は /private を省いた形で起動されることがある
+        ts.append(ts[0][len("/private"):])
+    for pid, _, cmd in procs:
+        if pid in mine:
+            continue
+        c = cmd.casefold()
+        for t in ts:
+            i = c.find(t)
+            while i != -1:
+                j = i + len(t)
+                if j == len(c) or not (c[j].isalnum() or c[j] in "._-"):
+                    return pid, cmd
+                i = c.find(t, i + 1)
+    return None
+
+
+def _identity(t, it):
+    """いまの t が索引時と同じもの（種類・dev/inode）で、途中経路にリンクが無いか。外れれば (status, 理由)。"""
     try:
         st = os.lstat(t)
     except OSError:
@@ -280,6 +348,18 @@ def check(it, ctx):
     kind = "dir" if stat.S_ISDIR(st.st_mode) else "file"
     if kind != it["kind"] or (st.st_dev, st.st_ino) != tuple(it["ident"]):
         return "skip", "索引時と別物（種類か inode が違う）。`stor scan` し直してから"
+    return None
+
+
+def check(it, ctx):
+    """1 件の全チェック。通れば None、外れれば (status, 理由)。dry-run と移動直前で同じものを使う。"""
+    t = it["target"]
+    why = deny_reason(t)
+    if why:
+        return "refused", why
+    bad = _identity(t, it)
+    if bad:
+        return bad
     mp = it["match_path"]
     if not _under(t, mp):
         return "skip", "規則の対象の外"
@@ -298,11 +378,23 @@ def check(it, ctx):
         if ctx.now - latest <= r.stale_days * 86400:
             return "skip", f"いまは放置ではない（プロジェクトの最終更新 {util.age_text(ctx.now - latest)}前）"
     limit = max(SIZE_FACTOR * it["size"], SIZE_FLOOR)
-    cur, bad = walk(t, limit, time.time() + SIZE_TIMEOUT, ctx)
+    cur, bad = walk(t, limit, time.time() + SIZE_TIMEOUT, ctx, rule=r, ident=it["ident"])
     if bad:
         return bad
     if cur > limit:
         return "skip", f"索引時 {util.human(it['size'])} から {util.human(cur)} 以上に増えている（2 倍超）"
+    # 稼働中の環境（venv で動いているサーバー等）は動かさない。lsof は遅いので ps のコマンドラインで見る
+    if ctx.procs is None or ctx.fresh_ps:
+        ctx.procs = util.processes()
+    if ctx.procs is None:
+        return "skip", "使用中か確かめられない（ps が使えない）"
+    u = in_use(t, ctx.procs)
+    if u:
+        return "skip", f"使用中（pid {u[0]} {util.esc(u[1][:80])}）"
+    # 走査・放置判定の間に差し替わっていないか、移す直前にもう一度確かめる
+    bad = _identity(t, it)
+    if bad:
+        return bad
     it["size_now"] = cur
     return None
 
@@ -328,6 +420,7 @@ def execute(items, ctx):
     except OSError as e:
         raise SystemExit(f"actions.jsonl に計画を記録できないので中止（何も動かしていない）: {e}")
     warns = []
+    ctx.fresh_ps = True
     for it in items:
         t0 = time.time()
         rec = {"time": _now(), "type": "result", "target": it["target"], "rule": it.get("rule"),

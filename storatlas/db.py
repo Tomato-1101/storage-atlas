@@ -12,18 +12,21 @@ MAX_ERRORS = 5000
 KEEP_SNAPSHOTS = 30     # 履歴（snapshots・hist・errors）は直近この回数分だけ残す
 _OPEN = []              # cli が終了時に閉じるための、開いた接続の一覧
 
-SCHEMA = """
+DIRS_SQL = """CREATE TABLE IF NOT EXISTS dirs(
+  id INTEGER PRIMARY KEY, path TEXT, parent INTEGER, depth INTEGER,
+  self_alloc INTEGER, self_files INTEGER, self_mtime REAL, self_cloud INTEGER, markers TEXT,
+  tot_alloc INTEGER, tot_files INTEGER, tot_mtime REAL, tot_cloud INTEGER, dev INTEGER, ino INTEGER)"""
+FILES_SQL = """CREATE TABLE IF NOT EXISTS files(
+  path TEXT, dir INTEGER, alloc INTEGER, size INTEGER, mtime REAL, dataless INTEGER, dev INTEGER, ino INTEGER)"""
+# own_alloc: 走査時の stor 自身の保存先（STOR_HOME）の合計。diff で祖先の増加から差し引く
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS snapshots(
   id INTEGER PRIMARY KEY, started REAL, duration REAL, roots TEXT,
   total_alloc INTEGER, total_files INTEGER, total_cloud INTEGER,
   df_total INTEGER, df_used INTEGER, df_free INTEGER, local_snapshots INTEGER,
-  dir_errors INTEGER, stat_errors INTEGER, mounts TEXT);
-CREATE TABLE IF NOT EXISTS dirs(
-  id INTEGER PRIMARY KEY, path TEXT, parent INTEGER, depth INTEGER,
-  self_alloc INTEGER, self_files INTEGER, self_mtime REAL, self_cloud INTEGER, markers TEXT,
-  tot_alloc INTEGER, tot_files INTEGER, tot_mtime REAL, tot_cloud INTEGER, dev INTEGER, ino INTEGER);
-CREATE TABLE IF NOT EXISTS files(
-  path TEXT, dir INTEGER, alloc INTEGER, size INTEGER, mtime REAL, dataless INTEGER, dev INTEGER, ino INTEGER);
+  dir_errors INTEGER, stat_errors INTEGER, mounts TEXT, own_alloc INTEGER);
+{DIRS_SQL};
+{FILES_SQL};
 CREATE TABLE IF NOT EXISTS hist(snap INTEGER, path TEXT, tot_alloc INTEGER);
 CREATE TABLE IF NOT EXISTS errors(snap INTEGER, path TEXT);
 CREATE INDEX IF NOT EXISTS hist_snap ON hist(snap);
@@ -34,7 +37,12 @@ def path():
     return os.path.join(util.stor_home(), "index.sqlite")
 
 
-def connect(must_exist=False):
+def _cols(con, table):
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+
+def connect(must_exist=False, for_scan=False):
+    """旧形式の索引は scan 以外では開かない（参照コマンドが索引を壊さないように。形式の移行は save_scan だけが行う）。"""
     p = path()
     if must_exist and not os.path.exists(p):
         raise SystemExit("索引がありません。先に `stor scan` を実行してください。")
@@ -42,15 +50,20 @@ def connect(must_exist=False):
     con = sqlite3.connect(p)
     _OPEN.append(con)
     con.executescript(SCHEMA)
-    if "dev" not in [r[1] for r in con.execute("PRAGMA table_info(dirs)")]:
-        # 旧形式（dirs に dev/ino が無い）。clean の同一性確認ができないので作り直しを求める
-        if must_exist:
-            raise SystemExit("索引の形式が古い（同一性確認用の列が無い）。`stor scan` で作り直してください。")
-        with con:
-            con.execute("DROP TABLE dirs")
-            con.execute("DROP TABLE files")
-        con.executescript(SCHEMA)
+    if not for_scan and "dev" not in _cols(con, "dirs"):
+        raise SystemExit("索引の形式が古い（同一性確認用の列が無い）。`stor scan` で作り直してください。")
     return con
+
+
+def _migrate(con):
+    """旧形式の表を新しい形式にする。save_scan のトランザクションの中で、新しい走査の保存と一体で行う。"""
+    if "dev" not in _cols(con, "dirs"):
+        con.execute("DROP TABLE dirs")
+        con.execute("DROP TABLE files")
+        con.execute(DIRS_SQL)
+        con.execute(FILES_SQL)
+    if "own_alloc" not in _cols(con, "snapshots"):
+        con.execute("ALTER TABLE snapshots ADD COLUMN own_alloc INTEGER")
 
 
 def close_since(n):
@@ -65,13 +78,17 @@ def save_scan(con, res, df, snaps):
     root_ids = [i for i, d in enumerate(dirs) if d[1] is None]
     total_alloc = sum(dirs[i][D_TALLOC] for i in root_ids)
     total_cloud = sum(dirs[i][D_TCLOUD] for i in root_ids)
+    own = os.path.realpath(util.stor_home())
+    own_alloc = next((d[D_TALLOC] for d in dirs if d[D_PATH] == own), 0)
     with con:
+        con.execute("BEGIN")  # 形式の移行（DROP/ALTER）も含めて 1 つのトランザクションにする
+        _migrate(con)
         cur = con.execute(
             "INSERT INTO snapshots(started,duration,roots,total_alloc,total_files,total_cloud,df_total,df_used,df_free,"
-            "local_snapshots,dir_errors,stat_errors,mounts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "local_snapshots,dir_errors,stat_errors,mounts,own_alloc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (res["started"], res["duration"], json.dumps(roots), total_alloc, res["nfiles"], total_cloud,
              df["total"], df["used"], df["free"], snaps, len(res["errors"]), res["stat_errors"],
-             json.dumps(res["mounts"][:50])))
+             json.dumps(res["mounts"][:50]), own_alloc))
         snap = cur.lastrowid
         # 最新の索引は毎回入れ替え（パス一覧の全履歴は持たない）
         con.execute("DELETE FROM dirs")

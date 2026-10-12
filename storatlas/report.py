@@ -15,8 +15,9 @@ TRASH_NOTE = ("> stor はゴミ箱へ移すだけ。ゴミ箱を空にするま�
 
 def growth(con):
     """直近 2 回の走査の差分（ディレクトリ単位）。子 1 つで 8 割以上説明できる親は子に譲る。
-    stor 自身の索引（STOR_HOME）の増減は除く。"""
-    snaps = con.execute("SELECT id, started, roots FROM snapshots ORDER BY id DESC LIMIT 2").fetchall()
+    stor 自身の索引（STOR_HOME）の増減は除く（履歴に残らない深さでも、走査時に保存した合計で祖先から差し引く）。"""
+    own_col = ", own_alloc" if "own_alloc" in [r[1] for r in con.execute("PRAGMA table_info(snapshots)")] else ""
+    snaps = con.execute(f"SELECT id, started, roots{own_col} FROM snapshots ORDER BY id DESC LIMIT 2").fetchall()
     if len(snaps) < 2:
         return None
     cur_id, prev_id = snaps[0][0], snaps[1][0]
@@ -24,7 +25,10 @@ def growth(con):
     prev = dict(con.execute("SELECT path, tot_alloc FROM hist WHERE snap=?", (prev_id,)))
     delta = {p: cur.get(p, 0) - prev.get(p, 0) for p in set(cur) | set(prev)}
     own = os.path.realpath(util.stor_home())
-    own_d = cur.get(own, 0) - prev.get(own, 0)
+    if own_col and snaps[0][3] is not None and snaps[1][3] is not None:
+        own_d = snaps[0][3] - snaps[1][3]
+    else:  # 保存前の形式の snapshot では履歴の値で代用する
+        own_d = cur.get(own, 0) - prev.get(own, 0)
     a = os.path.dirname(own)
     while own_d and a != os.path.dirname(a):
         if a in delta:
@@ -67,8 +71,11 @@ def build(con, res, snap, max_age):
         row = {"path": dirs[r][D_PATH], "alloc": dirs[r][D_TALLOC], "unclassified": res.unclassified(r)}
         row.update({s: res.cov[s][r] for s in SAFETIES})
         kids = sorted(res.children[r], key=lambda c: -dirs[c][D_TALLOC])
+        # 区域（container 規則）は中に別の区分を含むので、全体がその区分に見えないよう内訳を持たせる
         row["children"] = [{"path": dirs[c][D_PATH], "alloc": dirs[c][D_TALLOC],
-                            "unclassified": res.unclassified(c), "tag": res.tag(c)} for c in kids[:12]]
+                            "unclassified": res.unclassified(c), "tag": res.tag(c),
+                            "area": res.owner[c] == -1 and res.cont[c] != -1,
+                            "cov": {s: res.cov[s][c] for s in SAFETIES}} for c in kids[:12]]
         root_rows.append(row)
     return {
         "now": now,
@@ -144,7 +151,15 @@ def render(d, lim):
         for c in r["children"][:lim["children"]]:
             if c["alloc"] < util.GB:
                 break
-            tag = f"[{c['tag'][1]}:{c['tag'][0]}]" if c["tag"] else f"未分類 {H(c['unclassified'])}"
+            if c["tag"] and c["area"]:
+                parts = [f"{s} {H(c['cov'][s])}" for s in SAFETIES if c["cov"][s]]
+                if c["unclassified"]:
+                    parts.append(f"未分類 {H(c['unclassified'])}")
+                tag = f"[区域:{c['tag'][0]} 内に {' / '.join(parts)}]"
+            elif c["tag"]:
+                tag = f"[{c['tag'][1]}:{c['tag'][0]}]"
+            else:
+                tag = f"未分類 {H(c['unclassified'])}"
             L.append(f"  - {T(c['path'])} {H(c['alloc'])} {tag}")
     hs = d["hotspots"]
     if not hs:

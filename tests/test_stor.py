@@ -6,6 +6,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -598,6 +599,148 @@ class StorTest(unittest.TestCase):
             db.save_scan(con, res, {"total": 1, "used": 1, "free": 1}, 0)
         self.assertLessEqual(con.execute("SELECT count(*) FROM snapshots").fetchone()[0], 30)
         self.assertLessEqual(con.execute("SELECT count(DISTINCT snap) FROM hist").fetchone()[0], 30)
+
+    # ---- Codex 再レビュー（2026-10-12 2 回目）の指摘の再現 ----
+    def test_s1_subtree_review_by_real_files(self):
+        h = self.home
+        put(f"{h}/Library/Logs/mytracker/small.log", 500)  # 索引時は大きいファイル無し（app-logs が丸ごと持つ）
+        put(f"{h}/Library/Application Support/Slack/Cache/Service Worker/CacheStorage/a.bin", 5000)
+        # node_modules の中の node_modules（lockfile 無し）は同族の入れ子なので親を拒否しない
+        put(f"{h}/Project/app/node_modules/lib/package.json", 100)
+        put(f"{h}/Project/app/node_modules/lib/node_modules/y.js", 3000)
+        self.do_scan()
+        put(f"{h}/Library/Logs/mytracker/new-history.jsonl", 5000)  # 索引後に増えた本人記録
+        with mock.patch.object(clean_mod, "FILE_RULE_MIN", 1024, create=True):
+            out = self.clean_json("app-logs", "app-electron-cache", "dev-node-modules")
+        it = self.item(out, f"{h}/Library/Logs/mytracker")
+        self.assertEqual(it["status"], "refused", it)
+        self.assertIn("big-log-files", it["reason"])
+        it = self.item(out, f"{h}/Library/Application Support/Slack/Cache")
+        self.assertEqual(it["status"], "refused", it)
+        self.assertIn("app-sw-cache", it["reason"])
+        self.assertEqual(self.item(out, f"{h}/Project/app/node_modules")["status"], "ok")
+
+    def test_s2_identity_recheck_after_walk(self):
+        self.do_scan()
+        h = self.home
+        self.use_fake_trash()
+        orig = clean_mod.walk
+
+        def swap(p):
+            os.rename(p, os.path.join(self.tmp, "swapped-" + os.path.basename(os.path.dirname(p))))
+            put(f"{p}/lib/index.js", 30000)  # 同じ名前の別物
+
+        for target, after in ((f"{h}/Project/app/node_modules", True), (f"{h}/Project/old/node_modules", False)):
+            calls = []
+
+            def walk(path, *a, **k):
+                # 1 回目は dry-run 一覧（verify）、2 回目が移動直前のチェック。その最中に差し替わる
+                if path == target:
+                    calls.append(1)
+                hit = path == target and len(calls) == 2
+                if hit and not after:
+                    swap(path)
+                r = orig(path, *a, **k)
+                if hit and after:
+                    swap(path)
+                return r
+            with mock.patch.object(clean_mod, "walk", walk):
+                out = self.clean_json(target, "--yes")
+            it = self.item(out, target)
+            self.assertNotEqual(it["status"], "done", it)
+            self.assertIn("別物", it["reason"])
+            self.assertTrue(os.path.exists(f"{target}/lib/index.js"))
+
+    def test_s3_in_use_skipped(self):
+        self.do_scan()
+        h = self.home
+        venv = f"{h}/Project/py/.venv"
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"{venv}/bin/server"])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        out = self.clean_json("dev-venv", "dev-node-modules")
+        it = self.item(out, venv)
+        self.assertEqual(it["status"], "skip", it)
+        self.assertIn("使用中", it["reason"])
+        self.assertIn(str(p.pid), it["reason"])
+        self.assertEqual(self.item(out, f"{h}/Project/old/node_modules")["status"], "ok")
+        # 自分自身と祖先（stor を起動したシェル）は除く。前方一致は「/」区切りか完全一致だけ
+        t = f"{h}/Project/x/node_modules"
+        me = os.getpid()
+        procs = [(me, 999999, f"python3 stor clean {t} --yes"), (999999, 1, f"zsh -c 'stor clean {t}'"),
+                 (7, 1, f"node {t}2/x.js")]
+        self.assertIsNone(clean_mod.in_use(t, procs))
+        self.assertEqual(clean_mod.in_use(t, procs + [(8, 1, f"node {t}/.bin/next dev")])[0], 8)
+        self.assertEqual(clean_mod.in_use(t, procs + [(9, 1, f"rm-me {t}")])[0], 9)
+
+    def test_s4_old_index_rejected_and_migrated_only_by_scan(self):
+        import sqlite3
+        os.makedirs(os.environ["STOR_HOME"])
+        p = os.path.join(os.environ["STOR_HOME"], "index.sqlite")
+        con = sqlite3.connect(p)
+        con.executescript(db.SCHEMA.replace(", dev INTEGER, ino INTEGER);", ");")
+                          .replace(", dataless INTEGER, dev INTEGER, ino INTEGER);", ", dataless INTEGER);"))
+        con.execute("INSERT INTO snapshots(id, started, roots, df_used, df_free) VALUES(1, 0, '[]', 1, 1)")
+        con.execute("INSERT INTO dirs(id, path, depth, tot_alloc) VALUES(0, ?, 0, 1)", (self.home,))
+        con.commit()
+        con.close()
+        for argv in (["rules"], ["report"], ["tree", self.home], ["find"], ["diff"], ["dups"],
+                     ["clean", "app-caches"]):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_cli(*argv)
+            self.assertIn("scan", str(cm.exception.code), argv)
+        con = sqlite3.connect(p)
+        self.assertEqual(con.execute("SELECT count(*) FROM dirs").fetchone()[0], 1)
+        con.close()
+        self.run_cli("scan", "--root", self.home, "--quiet")
+        self.assertIn("dev-node-modules", self.run_cli("rules"))
+
+    def test_s5_notes_in_clean_and_rules(self):
+        h = self.home
+        put(f"{h}/Library/Application Support/Claude/vm_bundles/vm.bundle/disk.img", 50000)
+        self.do_scan()
+        self.assertIn("Claude アプリ使用中は消さない", self.run_cli("clean", "claude-vm-bundle"))
+        self.assertIn("Chrome を終了してから", self.run_cli("clean", "chrome-sign-clones"))
+        self.assertIn("Chrome を終了してから", self.run_cli("rules"))
+        self.use_fake_trash()
+        self.assertIn("Claude アプリ使用中は消さない", self.run_cli("clean", "claude-vm-bundle", "--yes"))
+
+    def test_s6_deadline_inside_entry_loop(self):
+        import itertools
+        import types
+        d = os.path.join(self.tmp, "flat")
+        for i in range(3):
+            put(f"{d}/f{i}", 100)
+        ctx = types.SimpleNamespace(personal_rx=[], artifacts=set(), rs=RuleSet())
+        with mock.patch("time.time", side_effect=itertools.chain([99], itertools.repeat(1000))):
+            total, bad = clean_mod.walk(d, 10 ** 12, 100, ctx)
+        self.assertIsNotNone(bad)
+        self.assertIn("時間切れ", bad[1])
+        with mock.patch("time.time", side_effect=itertools.chain([99], itertools.repeat(1000))):
+            self.assertIsNone(clean_mod.project_mtime(d, d + "/none", ctx, 100))
+
+    def test_s7_report_container_breakdown(self):
+        con, _ = self.do_scan()
+        with mock.patch.object(util, "GB", 1024):
+            out = render_budget(build(con, self.classified(con), db.latest(con), 3600), 100000)
+        line = next(x for x in out.splitlines() if x.strip().startswith("- ~/Project "))
+        self.assertIn("[区域:personal-projects 内に", line)
+        self.assertIn("regen", line)
+
+    def test_s8_self_index_excluded_at_any_depth(self):
+        orig = db.HIST_MIN
+        db.HIST_MIN = 0
+        self.addCleanup(setattr, db, "HIST_MIN", orig)
+        h = self.home
+        os.environ["STOR_HOME"] = f"{h}/a/b/c/d/stor"  # 履歴に残らない深さ 5
+        self.do_scan()
+        put(f"{h}/data/grow.bin", 200000)
+        put(f"{h}/a/b/c/d/stor/pad.bin", 300000)  # 索引自身の増加の代わり
+        self.do_scan()
+        out = self.run_cli("diff")
+        lines = [x for x in out.splitlines() if x.startswith("- ")]
+        self.assertTrue(any("~/data" in x for x in lines), out)
+        self.assertFalse([x for x in lines if "~/a" in x or x.endswith("~（現在") or " ~（" in x], out)
 
 
 if __name__ == "__main__":
