@@ -1,11 +1,14 @@
 """stor CLI。既定出力は簡潔な Markdown、--json で機械可読。"""
 import argparse
 import json
+import os
 import sys
 import time
 
+from . import apps as apps_mod
 from . import clean as clean_mod
 from . import db, util
+from . import offload as offload_mod
 from .classify import classify
 from .dups import find_dups
 from .report import build, growth, render_budget
@@ -14,6 +17,7 @@ from .scanner import D_PARENT, D_PATH, D_TALLOC, D_TFILES, scan
 
 T = util.disp
 H = util.human
+CLEAN_TOP = 10  # clean の既定表示で並べる対象の件数（サイズ上位）
 
 
 def _emit(args, obj, text):
@@ -190,12 +194,15 @@ def cmd_clean(args):
     files = db.load_files(con)
     res = classify(db.load_dirs(con), files, rs)
     ctx = clean_mod.Ctx(res, rs, files, stale=args.stale)
-    items = clean_mod.plan(ctx, args.targets, stale_only=args.stale)
+    items = clean_mod.plan(ctx, args.targets, stale_only=args.stale, personal=args.personal)
     # dry-run でも移動直前と同じ全チェックをかけ、--yes と同じ一覧を見せる
     clean_mod.verify(items, ctx)
     ok = [it for it in items if it["status"] == "ok"]
     count, total = len(ok), sum(it["size"] for it in ok)
     warns = clean_mod.execute(items, ctx) if args.yes else []
+    # 既定は要約（移す対象はサイズ上位 CLEAN_TOP 件、拒否・スキップ・失敗は全件）。--all で全件
+    moving = [it for it in items if it["status"] in ("ok", "done")]
+    shown = moving if args.all else sorted(moving, key=lambda it: -it.get("size", 0))[:CLEAN_TOP]
     lines = []
     for it in items:
         st = it["status"]
@@ -203,8 +210,16 @@ def cmd_clean(args):
             lines.append(f"- [{'拒否' if st == 'refused' else 'スキップ'}] {T(it['target'])}: {it['reason']}")
         elif st == "error":
             lines.append(f"- [失敗 rc={it.get('rc')}] {T(it['target'])}: {util.esc(it.get('stderr', '').strip())}")
+    for it in shown:
+        if it.get("via") == "rename":
+            lines.append(f"- [done] ~/.Trash へ直接移動 {T(it['target'])} → {T(it['dest'])} {H(it.get('size', 0))}"
+                         f"（{it['rule']}）")
         else:
-            lines.append(f"- [{st}] trash {T(it['target'])} {H(it.get('size', 0))}（{it['rule']}）")
+            lines.append(f"- [{it['status']}] trash {T(it['target'])} {H(it.get('size', 0))}（{it['rule']}）")
+    if len(shown) < len(moving):
+        rest = sorted(moving, key=lambda it: -it.get("size", 0))[CLEAN_TOP:]
+        lines.append(f"- 他 {len(rest)} 件 {H(sum(it.get('size', 0) for it in rest))}（全件は --all"
+                     + ("・actions.jsonl" if args.yes else "") + "）")
     head = [f"索引 {util.fmt_time(snap['started'])}（{util.age_text(age)}前）。サイズは索引上の値"]
     # 規則の操作条件（「Chrome を終了してから」等）は report で省略されても、ここでは必ず出す
     rids = [t for t in args.targets if t in rs.by_id] + [it["rule"] for it in items if it.get("rule")]
@@ -213,9 +228,13 @@ def cmd_clean(args):
     if args.yes:
         done = sum(1 for it in items if it["status"] == "done")
         err = sum(1 for it in items if it["status"] == "error")
-        head.append(f"実行: 対象 {count} 件 {H(total)} → ゴミ箱へ移動 {done} / 失敗 {err}"
+        renamed = sum(1 for it in items if it.get("via") == "rename")
+        head.append(f"実行: 対象 {count} 件 {H(total)} → ゴミ箱へ移動 {done} / 失敗 {err} / スキップ {count - done - err}"
                     f"（記録: {T(util.stor_home())}/actions.jsonl。ゴミ箱から戻せる。索引は `stor scan` で更新）")
         head.append("ゴミ箱を空にするまで空き容量は増えない（stor は空にしない）")
+        if renamed:
+            head.append(f"> trash が権限エラーだった {renamed} 件は ~/.Trash へ直接移した（Finder の「戻す」は使えない。"
+                        "元の場所は actions.jsonl）")
         if warns:
             head.append(f"> 警告: actions.jsonl への記録に失敗 {len(warns)} 件（移動は下の一覧のとおり）: "
                         + " / ".join(warns[:3]))
@@ -225,6 +244,40 @@ def cmd_clean(args):
     _emit(args, {"mode": "yes" if args.yes else "dry-run", "index_time": snap["started"], "count": count,
                  "total": total, "notes": notes, "warnings": warns, "items": items}, "\n".join(head + lines))
     if any(it["status"] == "error" for it in items):
+        sys.exit(1)
+
+
+def _index_sizes():
+    """索引上のディレクトリサイズを引く関数（索引が無ければ None）。"""
+    if not os.path.exists(db.path()):
+        return None, None
+    con = db.connect()
+    snap = con.execute("SELECT started FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+    if snap is None:
+        return None, None
+
+    def size_of(p):
+        r = con.execute("SELECT tot_alloc FROM dirs WHERE path=?", (p,)).fetchone()
+        return r[0] if r else None
+    return size_of, snap[0]
+
+
+def cmd_apps(args):
+    size_of, started = _index_sizes()
+    now = time.time()
+    rows = apps_mod.collect(size_of, now=now)
+    if args.unused:
+        rows = apps_mod.unused(rows, util.parse_age(args.unused), now)
+    idx = (f"サイズは索引上の値（{util.fmt_time(started)}）" if started else "索引なし（サイズは `stor scan` 後に出る）")
+    head = [f"アプリ {len(rows)} 本" + (f"（{args.unused} 以上未使用・記録なし）" if args.unused else "")
+            + f"。{idx}。最終使用は Spotlight の記録（記録なしが先頭、古い順）"]
+    _emit(args, rows, "\n".join(head + [apps_mod.line(r, now) for r in rows]))
+
+
+def cmd_offload(args):
+    obj, text, failed = offload_mod.run(args)
+    _emit(args, obj, text)
+    if failed:
         sys.exit(1)
 
 
@@ -271,7 +324,24 @@ def main(argv=None):
     p.add_argument("targets", nargs="+", metavar="RULE_ID|PATH")
     p.add_argument("--yes", action="store_true", help="実際に実行する")
     p.add_argument("--stale", action="store_true", help="放置プロジェクトの成果物だけに絞る")
+    p.add_argument("--personal", action="store_true",
+                   help="本人が選んだ personal 区分のパスも受け付ける（明示パスのときだけ。規則 ID では不可）")
+    p.add_argument("--all", action="store_true", help="対象を全件表示（既定はサイズ上位 10 件と、拒否・スキップ・失敗の全件）")
     p.set_defaults(fn=cmd_clean)
+
+    p = sub.add_parser("apps", parents=[common], help="アプリの最終使用日・サイズ・起動中・root 所有（読むだけ）")
+    p.add_argument("--unused", help="これ以上使っていない（と記録なし）だけ。例: 90d")
+    p.set_defaults(fn=cmd_apps)
+
+    p = sub.add_parser("offload", parents=[common],
+                       help="個人ファイルを iCloud Drive へ移し、アップロード後に Mac 側のコピーを外す（既定 dry-run）")
+    p.add_argument("targets", nargs="*", metavar="PATH")
+    p.add_argument("--to", help=f"iCloud Drive 内の移動先（相対パス。既定 {offload_mod.DEFAULT_SUB}）")
+    p.add_argument("--yes", action="store_true", help="実際に移動・evict する")
+    p.add_argument("--wait", action="store_true",
+                   help=f"アップロード完了まで待ってから外す（最長 {offload_mod.WAIT_MAX_MIN} 分）")
+    p.add_argument("--status", action="store_true", help="これまでに移したものの状態を見る（--yes で外せるものを外す）")
+    p.set_defaults(fn=cmd_offload)
 
     p = sub.add_parser("rules", parents=[common], help="規則一覧と現在の該当量")
     p.set_defaults(fn=cmd_rules)

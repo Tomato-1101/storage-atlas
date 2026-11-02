@@ -3,12 +3,15 @@ import json
 import os
 import time
 
-from . import util
+from . import apps as apps_mod
+from . import db, util
 from .classify import SAFETIES, hotspots
 from .scanner import D_PATH, D_TALLOC
 
 T = util.disp
 H = util.human
+ASK_AGE = 90 * 86400          # 「本人に聞く候補」: これより長く使っていない・触っていない
+ASK_FILE_MIN = 500 * util.MB  # 「本人に聞く候補」の個人ファイルの下限
 TRASH_NOTE = ("> stor はゴミ箱へ移すだけ。ゴミ箱を空にするまで空き容量は増えない。"
               "サイズは索引上の値。実行前に `stor clean <id>`（dry-run）で一覧を確認")
 
@@ -54,6 +57,29 @@ def growth(con):
             "roots_changed": snaps[0][2] != snaps[1][2]}
 
 
+def ask_candidates(con, res, now):
+    """本人に聞く候補: 長く使っていないアプリ（記録なしを含む）と、長く触っていない大きい個人ファイル（クラウド専用は除く）。"""
+    by_path, dirs = res.by_path, res.dirs
+
+    def size_of(p):
+        i = by_path.get(p)
+        return dirs[i][D_TALLOC] if i is not None else None
+    old_apps = apps_mod.unused(apps_mod.collect(size_of, procs=[], now=now), ASK_AGE, now)
+    old_apps.sort(key=lambda r: -(r["alloc"] or 0))
+    files = []
+    for f in db.load_files(con):
+        path, did, alloc, size, mtime, dataless = f[:6]
+        if dataless or alloc < ASK_FILE_MIN or now - mtime < ASK_AGE:
+            continue
+        if path in res.file_owner:
+            continue  # ファイル規則（古いインストーラ等）に当たるものは review 側で出る
+        tag = res.tag(did)
+        if tag and tag[1] == "personal":
+            files.append({"path": path, "alloc": alloc, "mtime": mtime, "area": tag[0]})
+    files.sort(key=lambda r: -r["alloc"])
+    return {"apps": old_apps, "files": files}
+
+
 def build(con, res, snap, max_age):
     now = time.time()
     dirs = res.dirs
@@ -96,6 +122,7 @@ def build(con, res, snap, max_age):
                    "top": sorted(err_groups.items(), key=lambda t: -t[1])[:5]},
         "trash": trash,
         "mounts": json.loads(snap["mounts"] or "[]"),
+        "ask": ask_candidates(con, res, now),
     }
 
 
@@ -143,6 +170,18 @@ def render(d, lim):
         L.append(f"- {r['id']}（{r['name']}）{H(r['alloc'])} {r['count']}件: {tops} ／ {how}{_note(r)}")
     if len(review) > lim["review"]:
         L.append(f"- 他 {len(review) - lim['review']} 規則（`stor rules`）")
+
+    ask, n = d["ask"], lim["ask"]
+    if n and (ask["apps"] or ask["files"]):
+        L.append(f"\n## 本人に聞く候補（{ASK_AGE // 86400} 日超 使っていない・触っていない）")
+        if ask["apps"]:
+            L.append(f"アプリ {len(ask['apps'])} 本（大きい順。一覧は `stor apps --unused {ASK_AGE // 86400}d`）:")
+            L += [apps_mod.line(r, d["now"]) for r in ask["apps"][:n]]
+        if ask["files"]:
+            L.append(f"個人ファイル {H(ASK_FILE_MIN)} 超 {len(ask['files'])} 件（クラウド専用は除く。"
+                     "消す `stor clean <path> --personal`／逃がす `stor offload <path>`）:")
+            L += [f"- {H(r['alloc'])} {util.age_text(d['now'] - r['mtime'])}前に更新 {T(r['path'])}"
+                  for r in ask["files"][:n]]
 
     L.append("\n## 大きい領域（未分類 = どの規則にも当たらない）")
     for r in d["roots"]:
@@ -197,12 +236,12 @@ def render(d, lim):
 
 
 LEVELS = [
-    dict(regen=8, review=8, review_top=2, children=6, hot=12, growth=5, errors=3),
-    dict(regen=6, review=6, review_top=2, children=5, hot=10, growth=5, errors=3),
-    dict(regen=5, review=5, review_top=1, children=4, hot=8, growth=5, errors=2),
-    dict(regen=4, review=4, review_top=1, children=3, hot=6, growth=5, errors=1),
-    dict(regen=3, review=3, review_top=1, children=2, hot=4, growth=3, errors=1),
-    dict(regen=2, review=2, review_top=1, children=1, hot=3, growth=3, errors=0),
+    dict(regen=8, review=8, review_top=2, children=6, hot=12, growth=5, errors=3, ask=5),
+    dict(regen=6, review=6, review_top=2, children=5, hot=10, growth=5, errors=3, ask=5),
+    dict(regen=5, review=5, review_top=1, children=4, hot=8, growth=5, errors=2, ask=4),
+    dict(regen=4, review=4, review_top=1, children=3, hot=6, growth=5, errors=1, ask=3),
+    dict(regen=3, review=3, review_top=1, children=2, hot=4, growth=3, errors=1, ask=2),
+    dict(regen=2, review=2, review_top=1, children=1, hot=3, growth=3, errors=0, ask=1),
 ]
 
 

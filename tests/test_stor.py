@@ -1,6 +1,7 @@
 """一時ディレクトリの偽ツリーで、集計・ハードリンク・規則判定・stale 判定・dry-run・personal 拒否を確かめる。
 実データには一切触れない（HOME と STOR_HOME を一時ディレクトリに向ける。ゴミ箱も偽物に差し替える）。"""
 import contextlib
+import errno
 import inspect
 import io
 import json
@@ -16,7 +17,10 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from storatlas import cli, db, util  # noqa: E402
+from storatlas import apps as apps_mod  # noqa: E402
 from storatlas import clean as clean_mod  # noqa: E402
+from storatlas import offload as offload_mod  # noqa: E402
+from storatlas import report as report_mod  # noqa: E402
 from storatlas.classify import classify  # noqa: E402
 from storatlas.report import build, render_budget  # noqa: E402
 from storatlas.rules import RuleSet  # noqa: E402
@@ -108,6 +112,12 @@ class StorTest(unittest.TestCase):
         put(f"{h}/Library/Application Support/Slack/Preferences", 500)
         self.fake_trash = os.path.join(self.tmp, "fake-trash")
         os.makedirs(self.fake_trash)
+        # アプリ一覧は実機の /Applications を見ない（report も apps を使う）
+        self.apps_dir = os.path.join(self.tmp, "Applications")
+        os.makedirs(self.apps_dir)
+        p = mock.patch.object(apps_mod, "APP_DIRS", [self.apps_dir, f"{h}/Applications"])
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         db.close_since(0)
@@ -128,13 +138,13 @@ class StorTest(unittest.TestCase):
     def classified(self, con):
         return classify(db.load_dirs(con), db.load_files(con), RuleSet())
 
-    def run_cli(self, *argv):
+    def run_cli(self, *argv, ok_codes=(0, None)):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try:
                 cli.main(list(argv))
             except SystemExit as e:
-                if e.code not in (0, None):
+                if e.code not in ok_codes:
                     raise
         return buf.getvalue()
 
@@ -757,6 +767,309 @@ class StorTest(unittest.TestCase):
         lines = [x for x in out.splitlines() if x.startswith("- ")]
         self.assertTrue(any("~/data" in x for x in lines), out)
         self.assertFalse([x for x in lines if "~/a" in x or x.endswith("~（現在") or " ~（" in x], out)
+
+    # ---- 11-03 追加: apps / clean --personal / ゴミ箱の代替 / 要約表示 / offload / 本人に聞く候補 ----
+    def make_apps(self, used):
+        """偽の .app と mdls の値（{名前: 何日前 or None}）。"""
+        now = time.time()
+        vals = {}
+        for name, days in used.items():
+            d = f"{self.apps_dir}/{name}" if not name.startswith("~") else name.replace("~", self.home, 1)
+            put(f"{d}/Contents/MacOS/bin", 3000)
+            vals[d] = "(null)" if days is None else time.strftime("%Y-%m-%d %H:%M:%S +0000",
+                                                                    time.gmtime(now - days * DAY))
+
+        def fake_mdls(paths):
+            return [vals.get(p, "(null)") for p in paths]
+        p = mock.patch.object(apps_mod, "_mdls", side_effect=fake_mdls)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_apps_list(self):
+        self.make_apps({"Old.app": 200, "New.app": 1, "Never.app": None, "~/Applications/Mine.app": 120})
+        root = f"{self.apps_dir}/Old.app"
+        procs = [(1, 0, "/sbin/launchd"), (5, 1, f"{self.apps_dir}/New.app/Contents/MacOS/bin")]
+        with mock.patch.object(apps_mod, "_uid", side_effect=lambda p: 0 if p == root else os.getuid()), \
+                mock.patch.object(util, "processes", return_value=procs):
+            self.do_scan()  # 索引なしでも動くが、ここでは索引ありでサイズを出す
+            out = self.run_cli("apps")
+            rows = json.loads(self.run_cli("apps", "--json"))
+            unused = json.loads(self.run_cli("apps", "--unused", "90d", "--json"))
+        names = [os.path.basename(r["path"]) for r in rows]
+        self.assertEqual(names, ["Never.app", "Old.app", "Mine.app", "New.app"])  # 記録なし → 古い順
+        by = {os.path.basename(r["path"]): r for r in rows}
+        self.assertTrue(by["Old.app"]["root"])
+        self.assertTrue(by["New.app"]["running"])
+        self.assertFalse(by["Old.app"]["running"])
+        self.assertEqual(by["Old.app"]["unused_days"], 200)
+        self.assertEqual({os.path.basename(r["path"]) for r in unused}, {"Never.app", "Old.app", "Mine.app"})
+        line = next(x for x in out.splitlines() if "Old.app" in x)
+        self.assertIn("Finder で削除・パスワード要", line)
+        self.assertIn("最終使用 200日前", line)
+        self.assertIn("[起動中]", next(x for x in out.splitlines() if "New.app" in x))
+        self.assertIn("記録なし", next(x for x in out.splitlines() if "Never.app" in x))
+        self.assertIn("~/Applications/Mine.app", out)
+        # mdls の件数が合わなければ 1 件ずつ取り直す
+        calls = []
+
+        def short(paths):
+            calls.append(len(paths))
+            return [] if len(paths) > 1 else ["2026-01-01 00:00:00 +0000"]
+        with mock.patch.object(apps_mod, "_mdls", side_effect=short):
+            got = apps_mod.last_used([f"{self.apps_dir}/a.app", f"{self.apps_dir}/b.app"])
+        self.assertEqual(calls, [2, 1, 1])
+        self.assertTrue(all(v is not None for v in got.values()))
+
+    def test_personal_only_by_explicit_path(self):
+        h = self.home
+        put(f"{h}/Desktop/note.txt", 100)
+        put(f"{h}/Pictures/Photos Library.photoslibrary/originals/a.heic", 5000)
+        self.do_scan()
+        doc = f"{h}/Documents/report.docx"
+        self.assertEqual(self.item(self.clean_json(doc), doc)["status"], "refused")
+        self.assertIn("--personal", self.item(self.clean_json(doc), doc)["reason"])
+        out = self.clean_json(doc, f"{h}/Project/old/src", "--personal")
+        self.assertEqual(self.item(out, doc)["status"], "ok", out)
+        self.assertEqual(self.item(out, doc)["rule"], "personal-home")
+        self.assertEqual(self.item(out, f"{h}/Project/old/src")["status"], "ok", out)
+        # 規則 ID では不可・区域そのもの・プロジェクトフォルダそのもの・写真ライブラリは --personal でも拒否
+        refused = {
+            "personal-home": "明示パス",
+            f"{h}/Documents": "対象外",
+            f"{h}/Desktop": "対象外",
+            f"{h}/Project/app": "プロジェクトフォルダそのもの",
+            f"{h}/Pictures/Photos Library.photoslibrary": "写真ライブラリ",
+            f"{h}/Pictures/Photos Library.photoslibrary/originals": "写真ライブラリ",
+            f"{h}/Project": "対象外",
+        }
+        for t, why in refused.items():
+            it = self.clean_json(t, "--personal")["items"][0]
+            self.assertEqual(it["status"], "refused", (t, it))
+            self.assertIn(why, it["reason"], (t, it))
+        # 配下の .git は --personal でも親ごと拒否
+        put(f"{h}/Documents/box/sub/.git/HEAD", 100)
+        self.do_scan()
+        it = self.item(self.clean_json(f"{h}/Documents/box", "--personal"), f"{h}/Documents/box")
+        self.assertEqual(it["status"], "refused", it)
+        self.assertIn(".git", it["reason"])
+        # 実行（偽ゴミ箱）と記録
+        self.use_fake_trash()
+        before = self.all_paths()
+        self.run_cli("clean", doc, "--personal")
+        self.assertEqual(before, self.all_paths())
+        out = self.run_cli("clean", doc, "--personal", "--yes")
+        self.assertIn("ゴミ箱へ移動 1", out)
+        self.assertFalse(os.path.exists(doc))
+        self.assertTrue(os.path.exists(f"{h}/Documents/proj/package.json"))
+        with open(os.path.join(os.environ["STOR_HOME"], "actions.jsonl")) as f:
+            log = [json.loads(x) for x in f]
+        self.assertEqual(log[-1]["result"], "done")
+        self.assertEqual(log[-1]["target"], doc)
+        self.assertEqual(log[-2]["type"], "plan")
+
+    def fake_trash_513(self):
+        fake = os.path.join(self.tmp, "fake-trash-513.sh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\necho "Error Domain=NSCocoaErrorDomain Code=513 \\"permission\\"" >&2\nexit 1\n')
+        os.chmod(fake, 0o755)
+        orig = clean_mod.TRASH_BIN
+        clean_mod.TRASH_BIN = fake
+        self.addCleanup(setattr, clean_mod, "TRASH_BIN", orig)
+
+    def test_trash_fallback_rename_without_overwrite(self):
+        h = self.home
+        put(f"{h}/.Trash/report.docx", 10)
+        with open(f"{h}/.Trash/report.docx", "rb") as f:
+            old = f.read()
+        self.do_scan()
+        self.fake_trash_513()
+        doc = f"{h}/Documents/report.docx"
+        out = self.run_cli("clean", doc, "--personal", "--yes")
+        self.assertIn("~/.Trash へ直接移動", out)
+        self.assertIn("「戻す」は使えない", out)
+        self.assertFalse(os.path.exists(doc))
+        with open(f"{h}/.Trash/report.docx", "rb") as f:
+            self.assertEqual(f.read(), old)  # 同名は上書きしない
+        moved = [n for n in os.listdir(f"{h}/.Trash") if n != "report.docx"]
+        self.assertEqual(len(moved), 1)
+        self.assertRegex(moved[0], r"^report \d\d-\d\d-\d\d-\d{3}\.docx$")
+        with open(os.path.join(os.environ["STOR_HOME"], "actions.jsonl")) as f:
+            rec = [json.loads(x) for x in f][-1]
+        self.assertEqual(rec["fallback"]["result"], "done")
+        self.assertEqual(rec["fallback"]["dest"], f"{h}/.Trash/{moved[0]}")
+        # rename も権限で失敗（root 所有など）ならスキップして Finder を案内する
+        put(f"{h}/Desktop/rec.mov", 20000)
+        self.do_scan()
+        with mock.patch.object(clean_mod, "rename_excl", side_effect=PermissionError(errno.EACCES, "denied")):
+            out = self.run_cli("clean", f"{h}/Desktop/rec.mov", "--personal", "--yes")
+        self.assertIn("[スキップ] ~/Desktop/rec.mov: 権限が無い（Finder でゴミ箱へ。パスワードを聞かれる）", out)
+        self.assertTrue(os.path.exists(f"{h}/Desktop/rec.mov"))
+        # 権限以外の失敗では代わりの移動をしない
+        with open(os.path.join(self.tmp, "fake-trash-513.sh"), "w") as f:
+            f.write('#!/bin/sh\necho "some other error" >&2\nexit 1\n')
+        out = json.loads(self.run_cli("clean", f"{h}/Desktop/rec.mov", "--personal", "--yes", "--json", ok_codes=(1,)))
+        self.assertEqual(out["items"][0]["status"], "error")
+        self.assertTrue(os.path.exists(f"{h}/Desktop/rec.mov"))
+        # 上書きしない rename そのもの
+        a, b = os.path.join(self.tmp, "ra"), os.path.join(self.tmp, "rb")
+        put(a, 10)
+        put(b, 20)
+        with self.assertRaises(FileExistsError):
+            clean_mod.rename_excl(a, b)
+        self.assertEqual(os.path.getsize(b), 20)
+
+    def test_clean_output_summarized(self):
+        h = self.home
+        for i in range(12):
+            put(f"{h}/Library/Caches/com.c{i:02d}/blob", 5000 + i * 4096)
+        self.do_scan()
+        out = self.run_cli("clean", "app-caches", f"{h}/data/a.bin")
+        self.assertEqual(sum(1 for x in out.splitlines() if x.startswith("- [ok] trash")), 10)
+        self.assertIn("- 他 3 件", out)
+        self.assertIn("全件は --all", out)
+        self.assertIn("[拒否] ~/data/a.bin", out)  # 拒否は全件
+        self.assertIn("com.c11", out)  # 大きい順
+        self.assertIn("対象 13 件", out)
+        full = self.run_cli("clean", "app-caches", "--all")
+        self.assertEqual(sum(1 for x in full.splitlines() if x.startswith("- [ok] trash")), 13)
+        self.assertEqual(len(self.clean_json("app-caches")["items"]), 13)  # --json は全件
+
+    def icloud(self):
+        root = f"{self.home}/Library/Mobile Documents/com~apple~CloudDocs"
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def fake_icloud(self, state):
+        """ic_status / evict の差し替え。state: {path: [state, local]}（無いパスは pending）。"""
+        evicted = []
+
+        def status(paths):
+            return {p: {"state": state.get(p, ["pending", "Current"])[0], "local": state.get(p, ["", "Current"])[1],
+                        "error": ""} for p in paths}
+
+        def ev(path):
+            evicted.append(path)
+            if path in state:
+                state[path][1] = "NotDownloaded"
+            return 0, ""
+        for name, fn in (("ic_status", status), ("evict", ev)):
+            p = mock.patch.object(offload_mod, name, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+        return evicted
+
+    def test_offload(self):
+        h = self.home
+        put(f"{h}/Desktop/rec.mov", 20000)
+        put(f"{h}/Desktop/clip/a.mov", 20000)
+        put(f"{h}/Desktop/clip/b.mov", 20000)
+        self.do_scan()
+        with self.assertRaises(SystemExit) as cm:
+            self.run_cli("offload", f"{h}/Desktop/rec.mov")
+        self.assertIn("iCloud Drive が無い", str(cm.exception.code))
+        root = self.icloud()
+        self.do_scan()
+        state = {}
+        evicted = self.fake_icloud(state)
+        before = self.all_paths()
+        out = self.run_cli("offload", f"{h}/Desktop/rec.mov", f"{h}/Desktop/clip")
+        self.assertIn("dry-run", out)
+        self.assertIn("iCloud Drive/Offload/", out)
+        self.assertEqual(before, self.all_paths())
+        # 個人ファイル以外・区域そのもの・プロジェクトフォルダ・iCloud の中・規則 ID は拒否
+        put(f"{root}/x.mov", 20000)
+        self.do_scan()
+        for t in (f"{h}/Project/app/node_modules", f"{h}/Desktop", f"{h}/Project/app", f"{root}/x.mov", "app-caches",
+                  f"{h}/data/a.bin"):
+            it = json.loads(self.run_cli("offload", t, "--json"))["items"][0]
+            self.assertEqual(it["status"], "refused", (t, it))
+        # 実行: 移す（アップロード待ちなので evict しない）
+        dest = f"{root}/Offload/rec.mov"
+        out = self.run_cli("offload", f"{h}/Desktop/rec.mov", f"{h}/Desktop/clip", "--yes")
+        self.assertIn("iCloud Drive へ移動 2", out)
+        self.assertFalse(os.path.exists(f"{h}/Desktop/rec.mov"))
+        self.assertTrue(os.path.exists(dest))
+        self.assertTrue(os.path.exists(f"{root}/Offload/clip/a.mov"))
+        self.assertEqual(evicted, [])
+        self.assertIn("アップロード済み 0/1", out)
+        # 後から状態だけ（evict しない）→ --yes でアップロード済みだけ外す
+        state[dest] = ["uploaded", "Current"]
+        state[f"{root}/Offload/clip/a.mov"] = ["uploaded", "Current"]
+        out = self.run_cli("offload", "--status")
+        self.assertIn("--status --yes", out)
+        self.assertEqual(evicted, [])
+        out = self.run_cli("offload", "--status", "--yes")
+        self.assertEqual(sorted(evicted), sorted([dest, f"{root}/Offload/clip/a.mov"]))
+        self.assertIn("evict 1/1", out)
+        self.assertIn("アップロード済み 1/2", out)  # clip/b.mov はまだ
+        out = self.run_cli("offload", "--status")
+        self.assertIn("外し済み 1 件", out)
+        # 同名が移動先にあれば上書きしない
+        put(f"{h}/Desktop/rec.mov", 30000)
+        self.do_scan()
+        size = os.path.getsize(dest)
+        it = json.loads(self.run_cli("offload", f"{h}/Desktop/rec.mov", "--yes", "--json"))["items"][0]
+        self.assertEqual(it["status"], "skip", it)
+        self.assertIn("上書きしない", it["reason"])
+        self.assertEqual(os.path.getsize(dest), size)
+        self.assertTrue(os.path.exists(f"{h}/Desktop/rec.mov"))
+        # --to は iCloud Drive 内の相対パスだけ
+        for bad in ("/tmp/x", "../x", "a/../../x"):
+            with self.assertRaises(SystemExit):
+                self.run_cli("offload", f"{h}/Desktop/rec.mov", "--to", bad)
+        out = self.run_cli("offload", f"{h}/Desktop/rec.mov", "--to", "Archive/2026", "--yes")
+        self.assertTrue(os.path.exists(f"{root}/Archive/2026/rec.mov"))
+        # evict が失敗したらそう報告する
+        state[f"{root}/Archive/2026/rec.mov"] = ["uploaded", "Current"]
+        with mock.patch.object(offload_mod, "evict", return_value=(1, "evict failed: not supported")):
+            out = self.run_cli("offload", "--status", "--yes", ok_codes=(1,))
+        self.assertIn("evict できない", out)
+        self.assertIn("最適化", out)
+
+    def test_wait_upload_progress(self):
+        seq = iter([0, 0, 1])
+
+        def status(paths):
+            n = next(seq)
+            return {p: {"state": "uploaded" if n else "uploading", "local": "Current", "error": ""} for p in paths}
+        f = os.path.join(self.tmp, "w.bin")
+        put(f, 10)
+        err = io.StringIO()
+        with mock.patch.object(offload_mod, "ic_status", side_effect=status), \
+                mock.patch.object(offload_mod.time, "sleep"), contextlib.redirect_stderr(err):
+            s = offload_mod.wait_upload([f], 1)
+        self.assertEqual(s[f]["uploaded"], 1)
+        self.assertEqual(err.getvalue().count("アップロード待ち"), 1)  # 変化が無い間は繰り返さない
+
+    def test_report_ask_candidates(self):
+        h = self.home
+        put(f"{h}/Movies/old.mov", 20000, age_days=200)
+        put(f"{h}/Movies/new.mov", 20000)
+        put(f"{h}/Documents/proj/node_modules/big.bin", 20000, age_days=200)  # regen は出さない
+        self.make_apps({"Old.app": 200, "New.app": 1, "Never.app": None})
+        con, _ = self.do_scan()
+        with mock.patch.object(report_mod, "ASK_FILE_MIN", 10000):
+            d = build(con, self.classified(con), db.latest(con), 3600)
+            out = render_budget(d, 100000)
+        sec = out.split("## 本人に聞く候補", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("~/Movies/old.mov", sec)
+        self.assertNotIn("new.mov", sec)
+        self.assertNotIn("node_modules", sec)
+        self.assertIn("Old.app", sec)
+        self.assertIn("Never.app", sec)
+        self.assertNotIn("New.app", sec)
+        self.assertLess(util.est_tokens(sec), 300)
+
+    def test_new_modules_no_deletion(self):
+        for mod, n in ((offload_mod, 3), (apps_mod, 1)):
+            src = inspect.getsource(mod)
+            self.assertEqual(src.count("subprocess.run("), n, mod.__name__)
+            for word in ("shutil", "os.remove", "unlink", "rmtree", "rmdir", '"rm"', "os.rename", "os.replace"):
+                self.assertNotIn(word, src, (mod.__name__, word))
+        src = inspect.getsource(offload_mod)
+        for cmd in ('["/usr/bin/swiftc", "-O"', "[_icstat_bin(), *chunk]", '["/usr/bin/brctl", "evict", path]'):
+            self.assertIn(cmd, src)
+        self.assertNotIn("os.rename", inspect.getsource(clean_mod))  # 上書きしうる rename は使わない
 
 
 if __name__ == "__main__":

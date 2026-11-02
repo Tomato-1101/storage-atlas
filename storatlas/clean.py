@@ -1,8 +1,12 @@
 """clean: 既定 dry-run。stor が実行する削除手段は /usr/bin/trash（ゴミ箱へ移動）ただ一つ（SPEC 不変条件 1）。
 公式クリーンコマンドも完全削除なので実行しない。対象ごとに多重チェック（不変条件 1a）を通ったものだけ動かす。
-チェックは dry-run の一覧作成時と、各対象をゴミ箱へ移す直前の 2 回、同じ check() で行う。"""
+チェックは dry-run の一覧作成時と、各対象をゴミ箱へ移す直前の 2 回、同じ check() で行う。
+/usr/bin/trash が権限エラー（Code=513 等）で失敗した時だけ、~/.Trash への上書きしない rename に落とす（これもゴミ箱へ移すだけ）。"""
+import ctypes
+import errno
 import json
 import os
+import re
 import stat
 import subprocess
 import time
@@ -16,6 +20,9 @@ SIZE_FLOOR = util.MB      # 小さいディレクトリはブロック単位の�
 SIZE_TIMEOUT = 120.0      # サイズ再計測・放置判定の走査の上限秒。測りきれなければスキップ
 INDEX_MAX_AGE = 86400     # これより古い索引では --yes を受け付けない
 FILE_RULE_MIN = BIG_FILE  # ファイル規則（big-log-files 等）は索引と同じく、この大きさ以上のファイルだけに当てる
+RENAME_EXCL = 0x4         # renamex_np の RENAME_EXCL（移動先に同名があれば EEXIST で失敗。上書きしない）
+PERM_ERR = re.compile(r"Code=513|permission|not permitted", re.I)  # /usr/bin/trash の権限エラー
+NO_PERM = "権限が無い（Finder でゴミ箱へ。パスワードを聞かれる）"
 D = util.disp
 
 
@@ -70,6 +77,23 @@ def deny_reason(path):
     return None
 
 
+def personal_deny(path, rs):
+    """--personal でも拒否する場所。当たれば理由、外れれば None（大文字小文字は区別しない）。"""
+    cf = path.casefold()
+    if any(part.endswith(".photoslibrary") for part in cf.split("/")):
+        return "写真ライブラリ（.photoslibrary）とその中は対象外（写真アプリで削除する）"
+    for r in rs.rules:
+        if r.safety != "personal":
+            continue
+        for rx in r.regexes:
+            rxi = re.compile(rx.pattern, re.I)
+            if rxi.fullmatch(path):
+                return f"personal 区域そのもの（{r.id}）は対象外"
+            if r.id == "personal-projects" and rxi.fullmatch(os.path.dirname(path)):
+                return "~/Project 等の直下のプロジェクトフォルダそのものは対象外"
+    return None
+
+
 class Ctx:
     """チェックに使う索引側の情報（規則・索引のファイル・保護すべき規則の対象）。"""
 
@@ -110,10 +134,11 @@ def _item(m, target, ctx):
             "ident": ident, "status": "ok", "op": "trash", "command": [TRASH_BIN, target], "size": size}
 
 
-def _plan_rule(ctx, rid, stale_only):
+def _plan_rule(ctx, rid, stale_only, personal=False):
     r = ctx.rs.by_id[rid]
     if r.safety == "personal":
-        return [_refuse(rid, "personal（本人データ）は clean できない")]
+        return [_refuse(rid, "personal（本人データ）は clean できない"
+                        + ("（--personal は明示パス指定のときだけ。規則 ID では不可）" if personal else ""))]
     agg = ctx.res.by_rule(stale_only=stale_only).get(rid)
     if not agg:
         return [{"target": rid, "status": "skip", "reason": "該当なし" + ("（放置分）" if stale_only else "")}]
@@ -122,7 +147,7 @@ def _plan_rule(ctx, rid, stale_only):
     return [_item(m, m.path, ctx) for m in agg["items"]]
 
 
-def _plan_path(ctx, raw):
+def _plan_path(ctx, raw, personal=False):
     res = ctx.res
     path = util.norm(raw)
     if not os.path.lexists(path):
@@ -142,9 +167,19 @@ def _plan_path(ctx, raw):
         if i is not None and res.owner[i] != -1:
             m = res.matches[res.owner[i]]
         elif i is not None and res.cont[i] != -1:
-            c = res.matches[res.cont[i]].rule
+            cm = res.matches[res.cont[i]]
+            c = cm.rule
             if c.safety == "personal":
-                return _refuse(path, f"personal（{c.id}）は clean できない")
+                if not personal:
+                    return _refuse(path, f"personal（{c.id}）は clean できない（本人が選んだパスなら --personal）")
+                # 本人が明示したパスだけ。区域そのもの・写真ライブラリ・プロジェクトフォルダそのものは拒否
+                why = personal_deny(path, ctx.rs)
+                if why:
+                    return _refuse(path, why, rule=c.id)
+                it = _item(cm, path, ctx)
+                if it["status"] == "ok":
+                    it.update(match_path=path, mkind=it["kind"], personal=True)
+                return it
             return _refuse(path, f"区域（{c.id}）の中で規則に当たらない部分は対象外")
     if m is None:
         return _refuse(path, "どの規則にも当たらない（未分類）パスは対象外")
@@ -155,10 +190,10 @@ def _plan_path(ctx, raw):
     return _item(m, path, ctx)
 
 
-def plan(ctx, targets, stale_only=False):
+def plan(ctx, targets, stale_only=False, personal=False):
     out = []
     for t in targets:
-        items = _plan_rule(ctx, t, stale_only) if t in ctx.rs.by_id else [_plan_path(ctx, t)]
+        items = _plan_rule(ctx, t, stale_only, personal) if t in ctx.rs.by_id else [_plan_path(ctx, t, personal)]
         planned = {it["target"] for it in out if it["status"] == "ok"}
         out.extend(it for it in items if not (it["status"] == "ok" and it["target"] in planned))
     return out
@@ -180,8 +215,8 @@ def _markers_now(d):
     return out
 
 
-def rule_now(rs, path, kind, now=None):
-    """いまのファイルシステムで path に最初に当たる規則（区域は除く）。"""
+def rule_now(rs, path, kind, now=None, containers=False):
+    """いまのファイルシステムで path に最初に当たる規則（containers=False なら区域は除く）。"""
     now = now or time.time()
     try:
         st = os.lstat(path)
@@ -189,7 +224,7 @@ def rule_now(rs, path, kind, now=None):
         return None
     cands = [(r, rx) for r in rs.file_rules for rx in r.regexes] if kind == "file" else rs.dir_candidates(path)
     for r, rx in cands:
-        if r.container or not rx.fullmatch(path):
+        if (r.container and not containers) or not rx.fullmatch(path):
             continue
         if r.child and not _markers_now(path) & set(r.child):
             continue
@@ -202,6 +237,18 @@ def rule_now(rs, path, kind, now=None):
         if r.excludes and any(x.fullmatch(path) for x in r.excludes):
             continue
         return r
+    return None
+
+
+def personal_now(rs, path, kind, now=None):
+    """いまのファイルシステムで path が personal 区域の中にあり、途中の階層も含めて他の規則（成果物・キャッシュ等）に
+    持たれていなければ、その区域の規則。分類と同じく最も深い区域が決める。区域そのものは None。"""
+    a, k = path, kind
+    while a not in ("/", ""):
+        r = rule_now(rs, a, k, now, containers=True)
+        if r is not None:
+            return r if r.container and r.safety == "personal" and a != path else None
+        a, k = os.path.dirname(a), "dir"
     return None
 
 
@@ -363,9 +410,17 @@ def check(it, ctx):
     mp = it["match_path"]
     if not _under(t, mp):
         return "skip", "規則の対象の外"
-    r = rule_now(ctx.rs, mp, it["mkind"], ctx.now)
-    if r is None or r.id != it["rule"]:
-        return "skip", f"いまの状態では規則 {it['rule']} に当たらない（{'当たる規則なし' if r is None else r.id}）"
+    if it.get("personal"):
+        why = personal_deny(t, ctx.rs)
+        if why:
+            return "refused", why
+        r = personal_now(ctx.rs, t, it["mkind"], ctx.now)
+        if r is None or r.id != it["rule"]:
+            return "skip", f"いまの状態では personal 区域（{it['rule']}）の中で他の規則に当たらない状態ではない"
+    else:
+        r = rule_now(ctx.rs, mp, it["mkind"], ctx.now)
+        if r is None or r.id != it["rule"]:
+            return "skip", f"いまの状態では規則 {it['rule']} に当たらない（{'当たる規則なし' if r is None else r.id}）"
     for p, rid in ctx.protected:
         if p != mp and _under(p, t):
             return "refused", f"配下に別の規則（{rid}）の対象がある（{D(p)}）"
@@ -413,6 +468,57 @@ def verify(items, ctx):
     return items
 
 
+def rename_excl(src, dst):
+    """上書きしない rename（macOS の renamex_np + RENAME_EXCL）。同名があれば EEXIST。使えなければ動かさずに失敗する。"""
+    try:
+        f = ctypes.CDLL(None, use_errno=True).renamex_np
+    except AttributeError:
+        raise OSError(errno.ENOTSUP, "renamex_np が使えない（上書きしない移動ができないので動かさない）", src)
+    f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    if f(os.fsencode(src), os.fsencode(dst), RENAME_EXCL) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e), dst)
+
+
+def _trash_name(base, n):
+    """ゴミ箱での名前。同名があれば「名前 HH-MM-SS-mmm.拡張子」（Finder と同じく拡張子の前に付ける）。"""
+    if n == 0:
+        return base
+    stem, ext = os.path.splitext(base)
+    t = time.time()
+    return f"{stem} {time.strftime('%H-%M-%S', time.localtime(t))}-{int(t * 1000) % 1000:03d}{ext}"
+
+
+def _rename_to_trash(it):
+    """/usr/bin/trash が権限エラーで失敗した時の代わり: ~/.Trash への上書きしない rename。
+    戻り値 (status, 詳細)。status は done（詳細=移動先）/ skip（権限が無い）/ error（詳細=理由）。"""
+    bad = _identity(it["target"], it)
+    if bad:
+        return "error", f"trash 失敗後の確認で外れた: {bad[1]}"
+    trash = os.path.join(util.home(), ".Trash")
+    try:
+        if not stat.S_ISDIR(os.lstat(trash).st_mode):
+            return "error", "~/.Trash がディレクトリでない"
+    except OSError:
+        return "error", "~/.Trash が無い"
+    base = os.path.basename(it["target"])
+    for n in range(5):
+        dst = os.path.join(trash, _trash_name(base, n))
+        if n and os.path.lexists(dst):
+            time.sleep(0.002)
+            continue
+        try:
+            rename_excl(it["target"], dst)
+            return "done", dst
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                continue
+            if e.errno in (errno.EACCES, errno.EPERM):
+                return "skip", NO_PERM
+            return "error", f"~/.Trash への移動に失敗: {e}"
+    return "error", "~/.Trash に同名があり、別名も作れなかった（上書きしない）"
+
+
 def execute(items, ctx):
     """計画を記録 → 各対象を移す直前に全チェックをやり直し → trash。全対象の結果を 1 件ずつ記録する。
     戻り値は記録に失敗した警告の一覧（移動自体は続ける。計画の記録に失敗した時だけ何も動かさずに止める）。"""
@@ -445,7 +551,19 @@ def execute(items, ctx):
                 it["rc"] = rc
                 if err:
                     it["stderr"] = err
-                rec.update(command=cmd, rc=rc, stderr=err, seconds=round(time.time() - t0, 2))
+                rec.update(command=cmd, rc=rc, stderr=err)
+                # ~/Desktop・~/Documents 配下で trash が Code=513 になることがある。その時だけ ~/.Trash へ rename
+                if rc != 0 and PERM_ERR.search(err):
+                    st, detail = _rename_to_trash(it)
+                    rec["fallback"] = {"op": "rename", "result": st, ("dest" if st == "done" else "reason"): detail}
+                    it["status"] = st
+                    if st == "done":
+                        it["via"], it["dest"] = "rename", detail
+                    elif st == "skip":
+                        it["reason"] = detail
+                    else:
+                        it["stderr"] = f"{err.strip()} / {detail}"
+                rec["seconds"] = round(time.time() - t0, 2)
         rec["result"] = it["status"]
         if it.get("reason"):
             rec["reason"] = it["reason"]
