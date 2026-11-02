@@ -12,3 +12,4 @@ AI にストレージ整理をさせる時、LLM に生の du/ls を読ませず
 ## 確認コマンド
 - `python3 -m unittest`（HOME/STOR_HOME を一時ディレクトリに向けて偽ツリーで検証）
 - `bin/stor report` / `bin/stor clean <rule>`（dry-run）。開発中に実機で `--yes` を打たない。
+- （2026-11-03 追記）offload のテストは icstat・brctl をモックする。開発中に実機で `offload --yes`・evict を打たない。

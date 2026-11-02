@@ -17,6 +17,11 @@ bin/stor diff                 # 前回走査からの増減
 bin/stor dups --min 50M       # 重複ファイル（ここだけ中身を読む）
 bin/stor clean dev-node-modules --stale        # 既定は dry-run（何も動かさない）
 bin/stor clean dev-node-modules --stale --yes  # ゴミ箱へ移動して actions.jsonl に記録（索引が 24 時間より古いと拒否）
+bin/stor clean dev-node-modules --all          # 一覧を全件出す（既定は件数・合計・大きい順 10 件と、注意・拒否・スキップ全件）
+bin/stor apps --unused 90d    # 90 日超使っていないアプリ（記録なしが先頭。root 所有は Finder で削除）
+bin/stor clean ~/Downloads/old.zip --personal  # 本人が選んだ個人ファイルをゴミ箱へ（パス指定のときだけ。dry-run）
+bin/stor offload ~/Movies/収録 --to Movies     # iCloud Drive/Movies へ移す（dry-run。--yes で移動、--wait でアップロード完了まで待つ）
+bin/stor offload --status --yes                # アップロードが済んだものの Mac 側を外す（brctl evict）
 ```
 
 ゴミ箱へ移すだけなので、ゴミ箱を空にするまで空き容量は増えない。表示サイズは索引上の値。
@@ -45,6 +50,13 @@ bin/stor clean dev-node-modules --stale --yes  # ゴミ箱へ移動して action
   `.git` とリポジトリのルート・personal 区域・ホームと既定 root の外。
 - 索引・履歴はリポジトリ外の `~/.local/share/stor/`（`STOR_HOME` で変更可）。パス一覧は個人情報なのでコミットしない。
 - 走査は stat のみ。シンボリックリンクを辿らず、マウントポイントを跨がない。
+- `--personal` は明示パスのときだけ（規則 ID では不可）。personal 区域そのもの・`~/Project` 直下のプロジェクトフォルダ・
+  写真ライブラリは --personal でも拒否。他のチェックは通常の clean と同じ。
+- `/usr/bin/trash` が権限エラー（Code=513 等）のときだけ `~/.Trash/` へ直接 rename する（同名は「名前 HH-MM-SS-mmm」、
+  上書きしない）。この場合 Finder の「戻す」は使えないので、元の場所は actions.jsonl を見る。rename もできなければスキップ。
+- offload は mv（上書きなし）と、アップロード完了を確かめた後の `brctl evict` だけ。iCloud の状態は Swift の小さなツール
+  `tools/icstat.swift` で読む（初回に `swiftc` で `~/.local/share/stor/bin/icstat` へ自動ビルド。手動なら
+  `swiftc -O tools/icstat.swift -o ~/.local/share/stor/bin/icstat`）。
 
 ## 規則を足す
 

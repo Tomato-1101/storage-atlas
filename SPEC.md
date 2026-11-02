@@ -27,6 +27,12 @@ AI には「約 2,000 トークンの要約」と「規則 ID 単位で実行で
 3. `personal` 区分（写真・書類・本人データ）は `clean` の対象にできない（指定されたら拒否）。
 4. 索引・履歴はリポジトリ外 `~/.local/share/stor/` に置く（パス一覧は個人情報。リポは GitHub へ自動同期される）。
 5. 走査はファイルの中身を読まない（stat のみ）。シンボリックリンクを辿らない。マウントポイントを跨がない。
+6. （2026-11-03 追記）本人が選んだ個人ファイルの扱い（3 の例外。1・1a はそのまま適用）:
+   - `clean <path> --personal` は**明示パス指定のときだけ** personal 区域の中を受け付ける。規則 ID（personal-* を含む）では --personal があっても拒否。
+   - --personal でも拒否: personal 区域そのもの（`~/Documents` 等の既定フォルダ・`~/Project` 自身）、`~/Project` 等の直下のプロジェクトフォルダそのもの、写真ライブラリ（`.photoslibrary`）とその中。それ以外の 1a のチェック（拒否リスト・実在・リンク・マウント・同一性・配下の `.git`・使用中・サイズ・24h 索引）は全部やり直す。
+   - 手段はゴミ箱だけ。`/usr/bin/trash` が権限エラー（Code=513 等）で失敗したときに限り `~/.Trash/` への rename に切り替える。同名があれば「名前 HH-MM-SS-mmm」にし、rename は `renamex_np(RENAME_EXCL)` で**既存を絶対に上書きしない**。rename も失敗したらスキップ（Finder でゴミ箱へ）。完全削除の手段は足さない。
+   - `offload <path> --yes` は個人ファイルを iCloud Drive（既定 `Offload/`）へ mv するだけ（上書きなし・同名はスキップ）。Mac 側を外す（`brctl evict`）のは iCloud への**アップロード完了を確認した後**だけで、クラウドの実体は残る。offload の対象選びと移動直前のチェックは `clean --personal` と同じ。
+   - dry-run・`--yes` の既定出力は件数・合計・大きい順 10 件と、全ての注意・拒否・スキップ・失敗。全件は `--all`・`--json`・actions.jsonl。
 
 ## コマンド
 ```
@@ -38,6 +44,9 @@ stor dups [--min 50M]            # 重複ファイル（サイズ→先頭/末�
 stor diff                        # 前回走査からの増減（ディレクトリ単位、上位 N）
 stor clean RULE_ID|PATH ... [--yes]   # 規則 ID 指定でその規則の候補を一括、またはパス指定。既定 dry-run
 stor rules                       # 規則一覧と現在の該当量
+stor apps [--unused 90d]         # .app を最終使用（Spotlight）の古い順に（サイズ・起動中・root 所有）。読むだけ（2026-11-03 追記）
+stor clean PATH ... --personal [--all] [--yes]   # 本人が選んだ個人ファイルをゴミ箱へ（不変条件 6）
+stor offload PATH ... [--to SUB] [--yes] [--wait] / stor offload --status [--yes]   # iCloud Drive へ移して Mac 側を外す
 ```
 全コマンド `--json` 対応（機械可読）。既定出力は人と AI が読める簡潔な Markdown。
 
@@ -77,6 +86,7 @@ safety の区分:
 4. 大きい領域トップ（深さ 2〜3 で、規則に当たらない「未分類」を明示）
 5. 前回比で増えた上位 5
 6. 走査外・権限エラー・ゴミ箱の中身
+（2026-11-03 追記）4 の前に「本人に聞く候補」: 90 日超使っていないアプリと、90 日超更新の無い 500MB 超の個人ファイル（iCloud のクラウド専用は除く）を各 5 件程度。
 サイズは人間可読（GB 小数 1 桁）。パスは ~ 省略形。
 
 ## 実装
