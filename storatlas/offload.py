@@ -24,10 +24,10 @@ PROGRESS_EVERY = 300  # 変化が無くてもこの秒数ごとに 1 行出す
 STATE_JA = {"uploaded": "アップロード済み", "uploading": "アップロード中", "pending": "アップロード待ち"}
 LOCALS = {"Current", "Downloaded", "NotDownloaded", "-"}
 # offload の結果の状態（機械可読）。全体の状態は行の中で最も悪いもの（この並びの前ほど悪い）
-RESULT_JA = {"unknown": "状態不明", "upload_failed": "アップロード失敗", "evict_failed": "evict 失敗",
+RESULT_JA = {"unknown": "状態不明", "missing": "移動先に無い", "upload_failed": "アップロード失敗", "evict_failed": "evict 失敗",
              "timeout": "時間切れ（アップロード未完了）", "pending": "移動済み・アップロード待ち",
              "uploaded": "アップロード済み・Mac 側はまだ外していない", "evicted": "evict 完了（Mac 側のコピーは外し済み）"}
-FAIL_STATES = {"unknown", "upload_failed", "evict_failed", "timeout"}  # 非ゼロ終了にする状態
+FAIL_STATES = {"unknown", "missing", "upload_failed", "evict_failed", "timeout"}  # 非ゼロ終了にする状態
 VIA_JA = {"trash": "ゴミ箱へ", "offload": "iCloud Drive へ"}
 
 
@@ -162,10 +162,30 @@ def manifest(src):
     return out
 
 
+def _sig(p, s):
+    """evict 直前の照合に使う、照会時の実体（実パス・dev・inode・サイズ・更新時刻）。"""
+    return [os.path.realpath(p), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns]
+
+
+def same_now(p, sig):
+    """いまの p が照会時の実体と同じ通常ファイルで、途中経路のリンクも変わらず iCloud Drive の中か。外れれば理由。"""
+    try:
+        s = os.lstat(p)
+    except OSError:
+        return "無くなった"
+    if not stat.S_ISREG(s.st_mode):
+        return "通常ファイルではなくなった"
+    if _sig(p, s) != sig:
+        return "照会の後に置き換わった・変更された（パス・inode・サイズ・更新時刻のどれかが違う）"
+    if not clean_mod._under(sig[0], os.path.realpath(util.home() + "/" + MOBILE_REL)):
+        return "実体が iCloud Drive の外にある"
+    return None
+
+
 def op_files(op):
-    """(移動時の一覧と同じ実体のファイル, 移動後に追加・置換されたファイルの数, 移動時から無くなった数)。
-    同じ実体 = 通常ファイルで inode とサイズが移動時の一覧と一致する。"""
-    keep, changed, missing, listed = [], 0, 0, set()
+    """(移動時の一覧と同じ実体のファイル, その照会時の実体 {path: _sig}, 移動後に追加・置換されたファイルの数,
+    移動時から無くなった数)。同じ実体 = 通常ファイルで inode とサイズが移動時の一覧と一致する。"""
+    keep, sigs, changed, missing, listed = [], {}, 0, 0, set()
     for f in op["files"]:
         p = os.path.join(op["dest"], f["rel"]) if f["rel"] else op["dest"]
         listed.add(p)
@@ -176,21 +196,29 @@ def op_files(op):
             continue
         if stat.S_ISREG(s.st_mode) and s.st_ino == f["ino"] and s.st_size == f["size"]:
             keep.append(p)
+            sigs[p] = _sig(p, s)
         else:
             changed += 1
     changed += sum(1 for p in files_of(op["dest"]) if p not in listed)
-    return keep, changed, missing
+    return keep, sigs, changed, missing
 
 
 def summarize(ops):
-    """操作 ID ごとの {files, status, uploaded, uploading, evicted, errors, changed, missing}。
-    状態を確かめられなければ QueryError。"""
-    per = {o["op_id"]: op_files(o) for o in ops}
-    st = ic_status(list(dict.fromkeys(f for keep, _, _ in per.values() for f in keep)))
+    """操作 ID ごとの {files, sigs, status, done, uploaded, uploading, evicted, errors, changed, missing}。
+    この操作で前に evict が成功したファイル（op["evicted"]）は done に数え、照会も evict もしない
+    （本人が後で再ダウンロードした物を外し直さない）。状態を確かめられなければ QueryError。"""
+    per, done = {}, {}
+    for o in ops:
+        keep, sigs, changed, missing = op_files(o)
+        ev = set(o.get("evicted") or ())
+        done[o["op_id"]] = sum(1 for f in keep if f in ev)
+        keep = [f for f in keep if f not in ev]
+        per[o["op_id"]] = (keep, sigs, changed, missing)
+    st = ic_status(list(dict.fromkeys(f for keep, _, _, _ in per.values() for f in keep)))
     out = {}
-    for oid, (fs, changed, missing) in per.items():
+    for oid, (fs, sigs, changed, missing) in per.items():
         s = [st[f] for f in fs]
-        out[oid] = {"files": fs, "status": s,
+        out[oid] = {"files": fs, "sigs": [sigs[f] for f in fs], "status": s, "done": done[oid],
                     "uploaded": sum(1 for x in s if x["state"] == "uploaded"),
                     "uploading": sum(1 for x in s if x["state"] == "uploading"),
                     "evicted": sum(1 for x in s if x["local"] == "NotDownloaded"),
@@ -229,12 +257,14 @@ def wait_upload(ops, minutes):
 
 def _row(o, x=None, query_error=None):
     row = {"op_id": o["op_id"], "dest": o["dest"], "files": 0, "uploaded": 0, "uploading": 0, "evicted_before": 0,
-           "errors": [], "changed": 0, "missing": 0, "evict": []}
+           "done": 0, "errors": [], "changed": 0, "missing": 0, "evict": [], "evict_skipped": []}
     if query_error is not None:
         row["query_error"] = query_error
     if x is not None:
-        row.update(files=len(x["files"]), uploaded=x["uploaded"], uploading=x["uploading"],
-                   evicted_before=x["evicted"], errors=x["errors"], changed=x["changed"], missing=x["missing"])
+        d = x["done"]
+        row.update(files=len(x["files"]) + d, uploaded=x["uploaded"] + d, uploading=x["uploading"],
+                   evicted_before=x["evicted"] + d, done=d, errors=x["errors"], changed=x["changed"],
+                   missing=x["missing"])
     return row
 
 
@@ -273,16 +303,21 @@ def settle(ops, yes, wait_min):
         x = s[o["op_id"]]
         row = _row(o, x)
         if yes:
-            for f, st in zip(x["files"], x["status"]):
+            for f, sig, st in zip(x["files"], x["sigs"], x["status"]):
                 if st["state"] == "uploaded" and st["local"] != "NotDownloaded":
+                    why = same_now(f, sig)  # 照会中・前の evict の間に別物へ置き換わっていたら外さない
+                    if why:
+                        row["evict_skipped"].append({"path": f, "reason": why})
+                        continue
                     rc, msg = evict(f)
-                    row["evict"].append({"path": f, "rc": rc, "msg": msg})
-            if row["evict"]:
-                try:
-                    clean_mod._log({"time": clean_mod._now(), "type": "offload", "op": "evict", "op_id": o["op_id"],
-                                    "dest": o["dest"], "results": row["evict"]})
-                except OSError as e:
-                    row["log_error"] = str(e)
+                    res = {"path": f, "rc": rc, "msg": msg}
+                    row["evict"].append(res)
+                    # 成功はファイルごとにすぐ記録する（再開時にこの操作から同じファイルを外し直さないため）
+                    try:
+                        clean_mod._log({"time": clean_mod._now(), "type": "offload", "op": "evict",
+                                        "op_id": o["op_id"], "dest": o["dest"], "results": [res]})
+                    except OSError as e:
+                        row["log_error"] = str(e)
         rows.append(row)
     ev = [o for o, r in zip(ops, rows) if r["evict"]]
     if ev:
@@ -290,7 +325,7 @@ def settle(ops, yes, wait_min):
             after = summarize(ev)
             for r in rows:
                 if r["op_id"] in after:
-                    r["evicted_after"] = after[r["op_id"]]["evicted"]
+                    r["evicted_after"] = after[r["op_id"]]["evicted"] + after[r["op_id"]]["done"]
         except QueryError as e:
             for r in rows:
                 if r["evict"]:
@@ -311,7 +346,9 @@ def settle_lines(rows):
     for r in rows:
         n = r["files"]
         st = f"[{RESULT_JA[r['state']]}]"
-        if r.get("query_error"):
+        if r["state"] == "missing":
+            st += f" 移動先が見つからない（元: {util.disp(r.get('src', ''))}。Finder で所在を確かめる）"
+        elif r.get("query_error"):
             st += (f" アップロード未確認・evict 未実行（状態を確かめられない: {util.esc(r['query_error'][:160])}）。"
                    "後で `stor offload --status`")
         elif n == 0:
@@ -339,6 +376,11 @@ def settle_lines(rows):
                 st += "（終わってから `stor offload --status --yes`）"
         if r["errors"]:
             st += f" ／ エラー: {util.esc(r['errors'][0][:120])}"
+        if r.get("evict_skipped"):
+            st += (f" ／ evict 直前に変わっていたファイル {len(r['evict_skipped'])}（外さない）: "
+                   f"{util.esc(r['evict_skipped'][0]['reason'])}")
+        if r.get("done"):
+            st += f" ／ 前回までに外したファイル {r['done']}（外し直さない）"
         if r["changed"]:
             st += f" ／ 移動後に追加・置換されたファイル {r['changed']}（外さない）"
         if r["missing"]:
@@ -478,16 +520,21 @@ def pending_ops():
         oid = e.get("op_id")
         if e.get("type") == "rename" and oid:
             if e.get("phase") == "begin" and e.get("src") and e.get("dst"):
-                ops[oid] = {"begin": e, "phase": None, "complete": False}
+                ops[oid] = {"begin": e, "phase": None, "complete": False, "evicted": set()}
             elif oid in ops:
                 ops[oid]["phase"] = e.get("phase")
         elif e.get("type") == "offload" and e.get("op") == "complete" and oid in ops:
             ops[oid]["complete"] = True
+        elif e.get("type") == "offload" and e.get("op") == "evict" and oid in ops:
+            for x in e.get("results") or []:
+                if isinstance(x, dict) and x.get("rc") == 0 and x.get("path"):
+                    ops[oid]["evicted"].add(x["path"])
     out, incomplete, n_complete = [], [], 0
     for oid, o in ops.items():
         b = o["begin"]
-        moved = o["phase"] == "done"
-        if o["phase"] is None:
+        # evict まで完了した操作は移動も済んでいる（完了の記録が無い rename の照合対象から外す）
+        moved = o["phase"] == "done" or (o["complete"] and b.get("via") == "offload")
+        if o["phase"] is None and not moved:
             st, why = reconcile(b)
             incomplete.append({"op_id": oid, "via": b.get("via"), "src": b["src"], "dst": b["dst"], "state": st,
                                "detail": why})
@@ -497,7 +544,8 @@ def pending_ops():
         if o["complete"]:
             n_complete += 1
         else:
-            out.append({"op_id": oid, "src": b["src"], "dest": b["dst"], "files": b.get("files") or []})
+            out.append({"op_id": oid, "src": b["src"], "dest": b["dst"], "files": b.get("files") or [],
+                        "evicted": sorted(o["evicted"])})
     return out, incomplete, n_complete
 
 
@@ -525,10 +573,12 @@ def run(args):
         ops, incomplete, n_complete = pending_ops()
         gone = [o["dest"] for o in ops if not os.path.lexists(o["dest"])]
         live = [o for o in ops if o["dest"] not in gone]
-        rows = settle(live, args.yes, wait)
+        rows = settle(live, args.yes, wait) + [dict(_row(o), state="missing", src=o["src"])
+                                               for o in ops if o["dest"] in gone]
         n_ev = sum(1 for r in rows if r["state"] == "evicted")
-        # 外し終えた操作でも、外さずに残した（移動後に追加・置換された）ファイルがあれば知らせる
-        rest = [r for r in rows if r["state"] != "evicted" or r["changed"]]
+        # 外し終えた操作でも、外さずに残したファイルや記録の失敗があれば知らせる
+        rest = [r for r in rows if r["state"] != "evicted" or r["changed"] or r.get("evict_skipped")
+                or r.get("log_error")]
         state = overall(rows)
         L = [f"offload の未完了 {len(ops)} 件（うち Mac 側を外し済み {n_ev} 件"
              + (f"・移動先に無い {len(gone)} 件" if gone else "") + f"。evict まで完了した {n_complete} 件は対象外）"]
@@ -542,7 +592,7 @@ def run(args):
             L += [f"- [{VIA_JA.get(x['via'], x['via'])}] {util.disp(x['src'])} → {ic_disp(x['dst'])}: {x['detail']}"
                   for x in incomplete]
         return ({"mode": "status", "state": state, "rows": rows, "gone": gone, "incomplete": incomplete,
-                 "completed": n_complete}, "\n".join(L), state in FAIL_STATES)
+                 "completed": n_complete}, "\n".join(L), state in FAIL_STATES or any(r.get("log_error") for r in rows))
     if not args.targets:
         raise SystemExit("パスを指定する（後から状態を見るなら `stor offload --status`）")
     ddir = dest_dir(args.to)
@@ -573,6 +623,7 @@ def run(args):
     state = overall(rows) if rows else None
     text = "\n".join(head + _item_lines(items)
                      + (["## iCloud の状態", f"全体の状態: {RESULT_JA[state]}"] + settle_lines(rows) if rows else []))
-    failed = any(it["status"] == "error" for it in items) or state in FAIL_STATES
+    failed = (any(it["status"] == "error" for it in items) or state in FAIL_STATES
+              or any(r.get("log_error") for r in rows))
     return {"mode": "yes" if args.yes else "dry-run", "state": state, "dest_dir": ddir, "count": len(ok),
             "total": total, "items": items, "icloud": rows, "warnings": warns}, text, failed

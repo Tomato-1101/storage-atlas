@@ -78,8 +78,9 @@ def deny_reason(path):
     return None
 
 
-def personal_deny(path, rs):
-    """--personal でも拒否する場所。当たれば理由、外れれば None（大文字小文字は区別しない）。"""
+def protected_deny(path, rs):
+    """どの経路（規則 ID・明示パス・--personal の有無）でも拒否する場所。当たれば理由、外れれば None
+    （大文字小文字は区別しない）。regen 等の規則に所有される場所でも、この中は動かさない。"""
     cf = path.casefold()
     # iCloud Drive の中をゴミ箱へ移すと、同期でクラウドと他の端末からも消える（ルートも含めて無条件に拒否）
     if _under(cf, os.path.join(util.home(), "Library/Mobile Documents").casefold()):
@@ -87,18 +88,28 @@ def personal_deny(path, rs):
                 "Mac の容量だけなら Finder の『ダウンロードを削除』）")
     if any(part.endswith(".photoslibrary") for part in cf.split("/")):
         return "写真ライブラリ（.photoslibrary）とその中は対象外（写真アプリで削除する）"
+    r = rs.by_id.get("personal-apple-apps")
+    for rx in (r.regexes if r else []):
+        rxi = re.compile(rx.pattern, re.I)
+        # DB を WAL 等から切り離して動かすと壊れるので、区域の中は一切動かさない
+        a = path
+        while a not in ("/", ""):
+            if rxi.fullmatch(a):
+                return f"アプリが管理するデータ（{r.name}）は対象外（アプリ内で整理する）"
+            a = os.path.dirname(a)
+    return None
+
+
+def personal_deny(path, rs):
+    """--personal でも拒否する場所。当たれば理由、外れれば None（大文字小文字は区別しない）。"""
+    why = protected_deny(path, rs)
+    if why:
+        return why
     for r in rs.rules:
         if r.safety != "personal":
             continue
         for rx in r.regexes:
             rxi = re.compile(rx.pattern, re.I)
-            if r.id == "personal-apple-apps":
-                # DB を WAL 等から切り離して動かすと壊れるので、区域の中は一切動かさない
-                a = path
-                while a not in ("/", ""):
-                    if rxi.fullmatch(a):
-                        return f"アプリが管理するデータ（{r.name}）は対象外（アプリ内で整理する）"
-                    a = os.path.dirname(a)
             if rxi.fullmatch(path):
                 return f"personal 区域そのもの（{r.id}）は対象外"
             if r.id == "personal-projects" and rxi.fullmatch(os.path.dirname(path)):
@@ -415,7 +426,7 @@ def _identity(t, it):
 def check(it, ctx):
     """1 件の全チェック。通れば None、外れれば (status, 理由)。dry-run と移動直前で同じものを使う。"""
     t = it["target"]
-    why = deny_reason(t)
+    why = deny_reason(t) or protected_deny(t, ctx.rs)
     if why:
         return "refused", why
     bad = _identity(t, it)
