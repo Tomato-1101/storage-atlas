@@ -33,6 +33,12 @@ AI には「約 2,000 トークンの要約」と「規則 ID 単位で実行で
    - 手段はゴミ箱だけ。`/usr/bin/trash` が権限エラー（Code=513 等）で失敗したときに限り `~/.Trash/` への rename に切り替える。同名があれば「名前 HH-MM-SS-mmm」にし、rename は `renamex_np(RENAME_EXCL)` で**既存を絶対に上書きしない**。rename も失敗したらスキップ（Finder でゴミ箱へ）。完全削除の手段は足さない。
    - `offload <path> --yes` は個人ファイルを iCloud Drive（既定 `Offload/`）へ mv するだけ（上書きなし・同名はスキップ）。Mac 側を外す（`brctl evict`）のは iCloud への**アップロード完了を確認した後**だけで、クラウドの実体は残る。offload の対象選びと移動直前のチェックは `clean --personal` と同じ。
    - dry-run・`--yes` の既定出力は件数・合計・大きい順 10 件と、全ての注意・拒否・スキップ・失敗。全件は `--all`・`--json`・actions.jsonl。
+   - （2026-11-03 再レビュー追記）--personal でも clean・offload とも拒否: Mail・Messages・ボイスメモのアプリ管理データ（personal-apple-apps 区域とその中。「アプリ内で整理」と案内）。clean --personal では iCloud Drive（`~/Library/Mobile Documents` 配下全部。CloudDocs のルートも含む）も拒否し、「iCloud 上の削除は iPhone など他の端末からも消える。Mac の容量だけなら Finder の『ダウンロードを削除』」と出す。`.photoslibrary`（大文字小文字を区別しない・任意の階層）は指定パス自身・その中・配下のどこにあっても拒否。
+   - rename（ゴミ箱への代替移動・offload の移動）は、移動前に操作 ID・元パス・移動先・dev/inode（offload は移動するファイルの一覧＝相対パス・サイズ・inode も）を actions.jsonl に書き、成功後に完了を追記する。移動前の記録が書けなければ動かさない。完了の記録が無い移動は `offload --status` で元と移動先を照合して出す。
+   - offload の iCloud 状態の照会（`tools/icstat.swift`）は 1 引数 1 行の JSON（パスは JSON 文字列）。形・状態値・問い合わせたパスとの対応・重複・欠けを検証し、1 つでも不正なら evict を全部やめる。照会ツールのビルドと動作確認は移動の前に行い、使えなければ何も動かさない。移動後に照会が失敗しても移動結果は必ず出し「アップロード未確認・evict 未実行」と明示する。
+   - evict するのは移動時の一覧と同じ実体（通常ファイルで inode とサイズが一致）のファイルだけ。移動後に追加・置換されたファイルは外さず、件数を出す。evict まで済んだ操作は完了を記録し、`--status`・`--status --yes` の対象から外す。
+   - offload の結果は状態（移動済み・アップロード待ち／アップロード済み・未 evict／アップロード失敗／状態不明／時間切れ／evict 失敗／evict 完了）で区別して出し、`--json` にも `state` を入れる。照会エラー・アップロード失敗・evict 失敗・`--wait` の時間切れは非ゼロ終了。
+   - report の「本人に聞く候補」には、上の規則で拒否されるもの（写真ライブラリ内・アプリ管理データ・iCloud 内）と、もう存在しないものを出さない。
 
 ## コマンド
 ```

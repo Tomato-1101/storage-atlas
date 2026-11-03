@@ -1003,7 +1003,7 @@ class StorTest(unittest.TestCase):
         self.assertIn("evict 1/1", out)
         self.assertIn("アップロード済み 1/2", out)  # clip/b.mov はまだ
         out = self.run_cli("offload", "--status")
-        self.assertIn("外し済み 1 件", out)
+        self.assertIn("evict まで完了した 1 件は対象外", out)  # 完了した操作は再開対象から外す
         # 同名が移動先にあれば上書きしない
         put(f"{h}/Desktop/rec.mov", 30000)
         self.do_scan()
@@ -1034,11 +1034,13 @@ class StorTest(unittest.TestCase):
             return {p: {"state": "uploaded" if n else "uploading", "local": "Current", "error": ""} for p in paths}
         f = os.path.join(self.tmp, "w.bin")
         put(f, 10)
+        op = {"op_id": "w", "dest": f, "files": offload_mod.manifest(f)}
         err = io.StringIO()
         with mock.patch.object(offload_mod, "ic_status", side_effect=status), \
                 mock.patch.object(offload_mod.time, "sleep"), contextlib.redirect_stderr(err):
-            s = offload_mod.wait_upload([f], 1)
-        self.assertEqual(s[f]["uploaded"], 1)
+            s, timed_out = offload_mod.wait_upload([op], 1)
+        self.assertEqual(s["w"]["uploaded"], 1)
+        self.assertFalse(timed_out)
         self.assertEqual(err.getvalue().count("アップロード待ち"), 1)  # 変化が無い間は繰り返さない
 
     def test_report_ask_candidates(self):
@@ -1059,6 +1061,329 @@ class StorTest(unittest.TestCase):
         self.assertIn("Never.app", sec)
         self.assertNotIn("New.app", sec)
         self.assertLess(util.est_tokens(sec), 300)
+
+    # ---- 2026-11-03 Codex 敵対的レビューの指摘 9 件 ----
+    def run_rc(self, *argv):
+        """(標準出力, 終了コード)。正常終了は 0。"""
+        buf, code = io.StringIO(), 0
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cli.main(list(argv))
+            except SystemExit as e:
+                code = e.code or 0
+        return buf.getvalue(), code
+
+    def log_entries(self):
+        with open(os.path.join(os.environ["STOR_HOME"], "actions.jsonl"), encoding="utf-8") as f:
+            return [json.loads(x) for x in f]
+
+    def test_c1_apple_app_data_refused(self):
+        h = self.home
+        paths = [f"{h}/Library/Messages/chat.db", f"{h}/Library/Mail/V10/box/1.emlx",
+                 f"{h}/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/a.m4a"]
+        for p in paths:
+            put(p, 5000)
+        self.icloud()
+        self.do_scan()
+        self.fake_icloud({})
+        self.use_fake_trash()
+        for t in paths + [f"{h}/Library/Mail/V10", f"{h}/Library/Messages"]:
+            it = self.clean_json(t, "--personal")["items"][0]
+            self.assertEqual(it["status"], "refused", (t, it))
+            self.assertIn("アプリ内で整理", it["reason"], (t, it))
+            it = json.loads(self.run_cli("offload", t, "--json"))["items"][0]
+            self.assertEqual(it["status"], "refused", (t, it))
+            self.assertIn("アプリ内で整理", it["reason"], (t, it))
+        before = self.all_paths()
+        self.run_cli("clean", *paths, "--personal", "--yes")
+        self.run_cli("offload", *paths, "--yes")
+        self.assertEqual(before, self.all_paths())
+
+    def test_c2_icloud_refused_in_clean_personal(self):
+        h = self.home
+        root = self.icloud()
+        put(f"{root}/資料/a.pdf", 5000)
+        put(f"{h}/Library/Mobile Documents/iCloud~com~x/Documents/b.txt", 5000)
+        self.do_scan()
+        for t in (root, f"{root}/資料", f"{root}/資料/a.pdf", f"{h}/Library/Mobile Documents/iCloud~com~x/Documents"):
+            it = self.clean_json(t, "--personal")["items"][0]
+            self.assertEqual(it["status"], "refused", (t, it))
+            self.assertIn("iPhone など他の端末からも消える", it["reason"], (t, it))
+            self.assertIn("『ダウンロードを削除』", it["reason"], (t, it))
+        self.use_fake_trash()
+        before = self.all_paths()
+        self.run_cli("clean", f"{root}/資料", f"{root}/資料/a.pdf", "--personal", "--yes")
+        self.assertEqual(before, self.all_paths())
+
+    def test_c3_icstat_json_lines_validated(self):
+        a, b = os.path.join(self.tmp, "a.mov"), os.path.join(self.tmp, "b.mov")
+        put(a, 10)
+        put(b, 10)
+
+        def J(p, st="pending", loc="Current", err=""):
+            return json.dumps({"path": p, "state": st, "local": loc, "error": err})
+
+        def ic(paths, stdout, rc=0):
+            cp = subprocess.CompletedProcess([], rc, stdout=stdout, stderr="")
+            with mock.patch.object(offload_mod, "_icstat_bin", return_value="/fake/icstat"), \
+                    mock.patch.object(offload_mod.subprocess, "run", return_value=cp):
+                return offload_mod.ic_status(paths)
+        self.assertEqual(ic([a, b], J(a) + "\n" + J(b, "uploaded") + "\n")[b]["state"], "uploaded")
+        # 改行・タブ入りの名前でも JSON 文字列なので、別のファイルの答えを偽装できない
+        evil = a + "\nuploaded\tCurrent\t\t" + b
+        r = ic([evil, b], J(evil) + "\n" + J(b) + "\n")
+        self.assertEqual((r[evil]["state"], r[b]["state"]), ("pending", "pending"))
+        bad = [
+            "pending\tCurrent\t\t" + a + "\nuploaded\tCurrent\t\t" + b + "\n",  # 旧形式（タブ区切り）の偽装
+            J(a) + "\n" + J(b, "done") + "\n",                                  # 不明な状態値
+            J(a) + "\n" + J(b, loc="Weird") + "\n",
+            J(a) + "\n" + J(os.path.join(self.tmp, "c.mov"), "uploaded") + "\n",  # 問い合わせていないパス
+            J(a) + "\n" + J(b) + "\n" + J(b, "uploaded") + "\n",                # 重複
+            J(a) + "\n",                                                         # 答えの欠け
+            json.dumps({"path": b, "state": "uploaded"}) + "\n" + J(a) + "\n",   # 形が違う
+            '["x"]\n',
+        ]
+        for out in bad:
+            with self.assertRaises(offload_mod.QueryError, msg=out):
+                ic([a, b], out)
+        with self.assertRaises(offload_mod.QueryError):
+            ic([a, b], J(a) + "\n" + J(b) + "\n", rc=1)
+        with mock.patch.object(offload_mod, "_icstat_bin", return_value="/fake/icstat"), \
+                mock.patch.object(offload_mod.subprocess, "run", side_effect=OSError("no such file")):
+            with self.assertRaises(offload_mod.QueryError):
+                offload_mod.ic_status([a])
+        # 不正な出力が 1 行でもあれば evict を全部やめる（正しく uploaded と答えたファイルも外さない）
+        d = os.path.join(self.tmp, "dst")
+        put(f"{d}/x.mov", 10)
+        put(f"{d}/y.mov", 10)
+        op = {"op_id": "o", "dest": d, "files": offload_mod.manifest(d)}
+        out = J(f"{d}/x.mov", "uploaded") + "\n" + J(f"{d}/y.mov", "bogus") + "\n"
+        cp = subprocess.CompletedProcess([], 0, stdout=out, stderr="")
+        with mock.patch.object(offload_mod, "_icstat_bin", return_value="/fake/icstat"), \
+                mock.patch.object(offload_mod.subprocess, "run", return_value=cp), \
+                mock.patch.object(offload_mod, "evict") as ev:
+            rows = offload_mod.settle([op], True, 0)
+        ev.assert_not_called()
+        self.assertEqual(rows[0]["state"], "unknown")
+        self.assertIn("evict 未実行", "\n".join(offload_mod.settle_lines(rows)))
+
+    def test_c4_nested_photoslibrary_refused(self):
+        h = self.home
+        put(f"{h}/Pictures/archive/Old.PhotosLibrary/originals/a.heic", 5000)
+        put(f"{h}/Pictures/archive/note.txt", 100)
+        put(f"{h}/Desktop/box/deep/My.photoslibrary/database/Photos.sqlite", 5000)
+        self.icloud()
+        self.do_scan()
+        self.fake_icloud({})
+        for t in (f"{h}/Pictures/archive", f"{h}/Pictures/archive/Old.PhotosLibrary",
+                  f"{h}/Pictures/archive/Old.PhotosLibrary/originals", f"{h}/Desktop/box"):
+            it = self.clean_json(t, "--personal")["items"][0]
+            self.assertEqual(it["status"], "refused", (t, it))
+            self.assertIn("写真ライブラリ", it["reason"], (t, it))
+            it = json.loads(self.run_cli("offload", t, "--json"))["items"][0]
+            self.assertEqual(it["status"], "refused", (t, it))
+            self.assertIn("写真ライブラリ", it["reason"], (t, it))
+        self.use_fake_trash()
+        before = self.all_paths()
+        self.run_cli("clean", f"{h}/Pictures/archive", f"{h}/Desktop/box", "--personal", "--yes")
+        self.run_cli("offload", f"{h}/Pictures/archive", f"{h}/Desktop/box", "--yes")
+        self.assertEqual(before, self.all_paths())
+
+    def test_c5_rename_journaled_before_move(self):
+        h = self.home
+        put(f"{h}/Desktop/rec.mov", 20000)
+        root = self.icloud()
+        os.makedirs(f"{h}/.Trash")
+        self.do_scan()
+        state = {}
+        evicted = self.fake_icloud(state)
+        real = clean_mod.rename_excl
+
+        def crash(src, dst):  # 移動した直後に止まる（記録を書く前）
+            real(src, dst)
+            raise KeyboardInterrupt
+        ino = os.lstat(f"{h}/Desktop/rec.mov").st_ino
+        with mock.patch.object(clean_mod, "rename_excl", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli("offload", f"{h}/Desktop/rec.mov", "--yes")
+        dest = f"{root}/Offload/rec.mov"
+        self.assertTrue(os.path.exists(dest))
+        b = [e for e in self.log_entries() if e.get("type") == "rename"]
+        self.assertEqual(len(b), 1)
+        self.assertEqual((b[0]["phase"], b[0]["via"], b[0]["src"], b[0]["dst"], b[0]["ino"]),
+                         ("begin", "offload", f"{h}/Desktop/rec.mov", dest, ino))
+        self.assertTrue(b[0]["op_id"] and b[0]["dev"] == os.lstat(dest).st_dev)
+        self.assertEqual(b[0]["files"], [{"rel": "", "size": 20000, "ino": ino}])
+        # 未完了の記録は元と先を照合して出し、移動済みなら再開対象に入る
+        out = self.run_cli("offload", "--status")
+        self.assertIn("完了の記録が無い移動", out)
+        self.assertIn("[iCloud Drive へ] ~/Desktop/rec.mov → iCloud Drive/Offload/rec.mov: 移動先にある", out)
+        self.assertIn("アップロード済み 0/1", out)
+        state[dest] = ["uploaded", "Current"]
+        self.run_cli("offload", "--status", "--yes")
+        self.assertEqual(evicted, [dest])
+        # 移動前の記録に書けなければ動かさない
+        put(f"{h}/Desktop/b.mov", 20000)
+        self.do_scan()
+        real_log = clean_mod._log
+
+        def no_begin(e):
+            if e.get("type") == "rename" and e.get("phase") == "begin":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            real_log(e)
+        with mock.patch.object(clean_mod, "_log", side_effect=no_begin):
+            out, rc = self.run_rc("offload", f"{h}/Desktop/b.mov", "--yes", "--json")
+        it = json.loads(out)["items"][0]
+        self.assertEqual((rc, it["status"]), (1, "error"))
+        self.assertIn("移動前の記録ができないので動かさない", it["stderr"])
+        self.assertTrue(os.path.exists(f"{h}/Desktop/b.mov"))
+        # clean のゴミ箱 fallback（rename）も同じく移動前に記録する
+        self.fake_trash_513()
+        doc = f"{h}/Documents/report.docx"
+        ino = os.lstat(doc).st_ino
+        with mock.patch.object(clean_mod, "rename_excl", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_cli("clean", doc, "--personal", "--yes")
+        b = [e for e in self.log_entries() if e.get("type") == "rename" and e.get("via") == "trash"]
+        self.assertEqual((b[-1]["src"], b[-1]["dst"], b[-1]["ino"]), (doc, f"{h}/.Trash/report.docx", ino))
+        out = self.run_cli("offload", "--status")
+        self.assertIn("[ゴミ箱へ] ~/Documents/report.docx → ~/.Trash/report.docx: 移動先にある", out)
+        # 完了まで記録できた rename は未完了に出さない
+        put(f"{h}/Desktop/c.mov", 20000)
+        self.do_scan()
+        self.run_cli("clean", f"{h}/Desktop/c.mov", "--personal", "--yes")
+        self.assertTrue(os.path.exists(f"{h}/.Trash/c.mov"))
+        self.assertNotIn("~/Desktop/c.mov", self.run_cli("offload", "--status"))
+
+    def test_c6_resume_skips_completed_and_changed_files(self):
+        h = self.home
+        put(f"{h}/Desktop/clip/a.mov", 20000)
+        put(f"{h}/Desktop/clip/b.mov", 20000)
+        put(f"{h}/Desktop/done.mov", 20000)
+        root = self.icloud()
+        self.do_scan()
+        state = {}
+        evicted = self.fake_icloud(state)
+        self.run_cli("offload", f"{h}/Desktop/clip", f"{h}/Desktop/done.mov", "--yes")
+        clip, done = f"{root}/Offload/clip", f"{root}/Offload/done.mov"
+        state[done] = ["uploaded", "Current"]
+        self.run_cli("offload", "--status", "--yes")
+        self.assertEqual(evicted, [done])
+        self.assertTrue(any(e.get("op") == "complete" for e in self.log_entries()))
+        # 完了した場所に後から置いた別ファイル・移動後に追加・置換したファイルは外さない
+        self.set_aside(done)
+        put(done, 30000)
+        put(f"{clip}/c.mov", 20000)
+        put(f"{clip}/.new-b", 20000)
+        os.replace(f"{clip}/.new-b", f"{clip}/b.mov")
+        for p in (done, f"{clip}/a.mov", f"{clip}/b.mov", f"{clip}/c.mov"):
+            state[p] = ["uploaded", "Current"]
+        evicted.clear()
+        out = self.run_cli("offload", "--status", "--yes")
+        self.assertEqual(evicted, [f"{clip}/a.mov"])
+        self.assertIn("移動後に追加・置換されたファイル 2（外さない）", out)
+        self.assertIn("evict まで完了した 1 件は対象外", out)
+        out = self.run_cli("offload", "--status", "--yes")
+        self.assertIn("evict まで完了した 2 件は対象外", out)
+        self.assertEqual(evicted, [f"{clip}/a.mov"])
+
+    def test_c7_icstat_checked_before_move(self):
+        h = self.home
+        rec = f"{h}/Desktop/rec.mov"
+        put(rec, 20000)
+        root = self.icloud()
+        self.do_scan()
+        with mock.patch.object(offload_mod, "_icstat_bin", side_effect=offload_mod.QueryError("icstat をビルドできない")):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_cli("offload", rec, "--yes")
+        self.assertIn("何も動かしていない", str(cm.exception.code))
+        self.assertTrue(os.path.exists(rec))
+        self.assertFalse(os.path.lexists(f"{root}/Offload/rec.mov"))
+        # 移動後の照会に失敗しても、移動結果を出して「アップロード未確認・evict 未実行」と書き、非ゼロで終える
+        calls = []
+
+        def flaky(paths):
+            calls.append(paths)
+            if len(calls) == 1:
+                return {p: {"state": "pending", "local": "Current", "error": ""} for p in paths}
+            raise offload_mod.QueryError("icstat が失敗した（rc=1）")
+        with mock.patch.object(offload_mod, "ic_status", side_effect=flaky), \
+                mock.patch.object(offload_mod, "evict") as ev:
+            out, rc = self.run_rc("offload", rec, "--yes")
+        ev.assert_not_called()
+        self.assertEqual(rc, 1)
+        self.assertIn("[移動] ~/Desktop/rec.mov → iCloud Drive/Offload/rec.mov", out)
+        self.assertIn("アップロード未確認・evict 未実行", out)
+        self.assertIn("全体の状態: 状態不明", out)
+
+    def test_c8_offload_states_and_exit_codes(self):
+        h = self.home
+        for n in ("a", "b"):
+            put(f"{h}/Desktop/{n}.mov", 20000)
+        root = self.icloud()
+        self.do_scan()
+        st = {}
+
+        def status(paths):
+            return {p: dict(zip(("state", "local", "error"), st.get(p, ("pending", "Current", "")))) for p in paths}
+
+        def ev(path):
+            st[path] = ("uploaded", "NotDownloaded", "")
+            return 0, ""
+        a, b = f"{root}/Offload/a.mov", f"{root}/Offload/b.mov"
+        with mock.patch.object(offload_mod, "ic_status", side_effect=status), \
+                mock.patch.object(offload_mod, "evict", side_effect=ev):
+            out, rc = self.run_rc("offload", f"{h}/Desktop/a.mov", "--yes", "--json")
+            self.assertEqual((rc, json.loads(out)["state"]), (0, "pending"))  # 待つ指定が無ければ成功終了
+            self.assertEqual(json.loads(out)["icloud"][0]["state"], "pending")
+            st[a] = ("pending", "Current", "iCloud の容量が足りない")
+            out, rc = self.run_rc("offload", "--status", "--json")
+            self.assertEqual((rc, json.loads(out)["state"]), (1, "upload_failed"))
+            self.assertIn("アップロード失敗", self.run_rc("offload", "--status")[0])
+            with mock.patch.object(offload_mod, "WAIT_MAX_MIN", 0.0001), mock.patch.object(offload_mod.time, "sleep"):
+                out, rc = self.run_rc("offload", f"{h}/Desktop/b.mov", "--yes", "--wait", "--json")
+            self.assertEqual((rc, json.loads(out)["state"]), (1, "timeout"))
+            st[a] = ("uploaded", "Current", "")
+            out, rc = self.run_rc("offload", "--status", "--json")
+            self.assertEqual((rc, json.loads(out)["state"]), (0, "pending"))  # a は uploaded・b は待ち
+            self.assertEqual(sorted(r["state"] for r in json.loads(out)["rows"]), ["pending", "uploaded"])
+            st[b] = ("uploaded", "Current", "")
+            out, rc = self.run_rc("offload", "--status", "--yes", "--json")
+            self.assertEqual((rc, json.loads(out)["state"]), (0, "evicted"))
+        put(f"{h}/Desktop/c.mov", 20000)
+        self.do_scan()
+        calls = []
+
+        def once(paths):
+            calls.append(1)
+            if len(calls) == 1:
+                return status(paths)
+            raise offload_mod.QueryError("icstat の出力が JSON でない")
+        with mock.patch.object(offload_mod, "ic_status", side_effect=once):
+            self.run_rc("offload", f"{h}/Desktop/c.mov", "--yes")
+        with mock.patch.object(offload_mod, "ic_status", side_effect=offload_mod.QueryError("icstat の出力が JSON でない")):
+            out, rc = self.run_rc("offload", "--status", "--json")
+        self.assertEqual((rc, json.loads(out)["state"]), (1, "unknown"))
+
+    def test_c9_report_ask_excludes_refused_and_gone(self):
+        h = self.home
+        root = self.icloud()
+        old = 200
+        put(f"{h}/Pictures/Photos Library.photoslibrary/originals/v.mov", 20000, age_days=old)
+        put(f"{h}/Library/Messages/Attachments/v.mov", 20000, age_days=old)
+        put(f"{root}/v.mov", 20000, age_days=old)
+        put(f"{h}/Movies/old.mov", 20000, age_days=old)
+        put(f"{h}/Movies/gone.mov", 20000, age_days=old)
+        con, _ = self.do_scan()
+        self.set_aside(f"{h}/Movies/gone.mov")
+        with mock.patch.object(report_mod, "ASK_FILE_MIN", 10000):
+            d = build(con, self.classified(con), db.latest(con), 3600)
+            out = render_budget(d, 100000)
+        sec = out.split("## 本人に聞く候補", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("~/Movies/old.mov", sec)
+        for bad in ("photoslibrary", "Messages", "Mobile Documents", "gone.mov"):
+            self.assertNotIn(bad, sec)
+        self.assertEqual([r["path"] for r in d["ask"]["files"]], [f"{h}/Movies/old.mov"])
 
     def test_new_modules_no_deletion(self):
         for mod, n in ((offload_mod, 3), (apps_mod, 1)):

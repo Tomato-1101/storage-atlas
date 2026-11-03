@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import time
+import uuid
 
 from . import util
 from .scanner import BIG_FILE, D_DEV, D_INO, D_TALLOC, marker_of
@@ -80,6 +81,10 @@ def deny_reason(path):
 def personal_deny(path, rs):
     """--personal でも拒否する場所。当たれば理由、外れれば None（大文字小文字は区別しない）。"""
     cf = path.casefold()
+    # iCloud Drive の中をゴミ箱へ移すと、同期でクラウドと他の端末からも消える（ルートも含めて無条件に拒否）
+    if _under(cf, os.path.join(util.home(), "Library/Mobile Documents").casefold()):
+        return ("iCloud Drive の中は対象外（iCloud 上の削除は iPhone など他の端末からも消える。"
+                "Mac の容量だけなら Finder の『ダウンロードを削除』）")
     if any(part.endswith(".photoslibrary") for part in cf.split("/")):
         return "写真ライブラリ（.photoslibrary）とその中は対象外（写真アプリで削除する）"
     for r in rs.rules:
@@ -87,6 +92,13 @@ def personal_deny(path, rs):
             continue
         for rx in r.regexes:
             rxi = re.compile(rx.pattern, re.I)
+            if r.id == "personal-apple-apps":
+                # DB を WAL 等から切り離して動かすと壊れるので、区域の中は一切動かさない
+                a = path
+                while a not in ("/", ""):
+                    if rxi.fullmatch(a):
+                        return f"アプリが管理するデータ（{r.name}）は対象外（アプリ内で整理する）"
+                    a = os.path.dirname(a)
             if rxi.fullmatch(path):
                 return f"personal 区域そのもの（{r.id}）は対象外"
             if r.id == "personal-projects" and rxi.fullmatch(os.path.dirname(path)):
@@ -306,6 +318,8 @@ def walk(path, limit, deadline, ctx, rule=None, ident=None):
                         return timeout
                     if e.name.casefold() == ".git":
                         return None, ("refused", f"配下に .git がある（{D(e.path)}）")
+                    if e.name.casefold().endswith(".photoslibrary"):
+                        return None, ("refused", f"配下に写真ライブラリがある（{D(e.path)}。写真アプリで整理する）")
                     s = e.stat(follow_symlinks=False)
                     if rule is not None:
                         r = sub_rule(ctx.rs, e.path, s, rule.order)
@@ -480,6 +494,35 @@ def rename_excl(src, dst):
         raise OSError(e, os.strerror(e), dst)
 
 
+class JournalError(Exception):
+    """移動前の記録（actions.jsonl）に書けない。この時は動かさない。"""
+
+
+def journaled_rename(src, dst, via, ident, extra=None):
+    """上書きしない rename を「移動前に記録（操作 ID・元・先・dev/inode）→ 移動 → 完了を追記」の順で行う。
+    途中で止まっても、未完了の記録を元と先の実物（dev/inode）と照合すれば、どちらにあるか分かる。
+    移動前の記録に失敗したら動かさない（JournalError）。戻り値 (操作 ID, 完了の記録に失敗した理由 or None)。"""
+    op = uuid.uuid4().hex
+    try:
+        _log(dict({"time": _now(), "type": "rename", "phase": "begin", "op_id": op, "via": via, "src": src,
+                   "dst": dst, "dev": ident[0], "ino": ident[1]}, **(extra or {})))
+    except OSError as e:
+        raise JournalError(str(e))
+    try:
+        rename_excl(src, dst)
+    except OSError as e:
+        try:
+            _log({"time": _now(), "type": "rename", "phase": "failed", "op_id": op, "error": str(e)})
+        except OSError:
+            pass  # 未完了のまま残っても、照合で「元の場所にある」と分かる
+        raise
+    try:
+        _log({"time": _now(), "type": "rename", "phase": "done", "op_id": op})
+    except OSError as e:
+        return op, str(e)
+    return op, None
+
+
 def _trash_name(base, n):
     """ゴミ箱での名前。同名があれば「名前 HH-MM-SS-mmm.拡張子」（Finder と同じく拡張子の前に付ける）。"""
     if n == 0:
@@ -508,8 +551,10 @@ def _rename_to_trash(it):
             time.sleep(0.002)
             continue
         try:
-            rename_excl(it["target"], dst)
+            it["op_id"] = journaled_rename(it["target"], dst, "trash", it["ident"])[0]
             return "done", dst
+        except JournalError as e:
+            return "error", f"actions.jsonl に移動前の記録ができないので動かさない: {e}"
         except OSError as e:
             if e.errno == errno.EEXIST:
                 continue
@@ -556,6 +601,8 @@ def execute(items, ctx):
                 if rc != 0 and PERM_ERR.search(err):
                     st, detail = _rename_to_trash(it)
                     rec["fallback"] = {"op": "rename", "result": st, ("dest" if st == "done" else "reason"): detail}
+                    if it.get("op_id"):
+                        rec["fallback"]["op_id"] = it["op_id"]
                     it["status"] = st
                     if st == "done":
                         it["via"], it["dest"] = "rename", detail

@@ -4,8 +4,10 @@ import os
 import time
 
 from . import apps as apps_mod
+from . import clean as clean_mod
 from . import db, util
 from .classify import SAFETIES, hotspots
+from .rules import RuleSet
 from .scanner import D_PATH, D_TALLOC
 
 T = util.disp
@@ -58,7 +60,8 @@ def growth(con):
 
 
 def ask_candidates(con, res, now):
-    """本人に聞く候補: 長く使っていないアプリ（記録なしを含む）と、長く触っていない大きい個人ファイル（クラウド専用は除く）。"""
+    """本人に聞く候補: 長く使っていないアプリ（記録なしを含む）と、長く触っていない大きい個人ファイル（クラウド専用は除く）。
+    clean --personal・offload で拒否される場所（写真ライブラリ・アプリ管理データ・iCloud の中）と、もう無いファイルは出さない。"""
     by_path, dirs = res.by_path, res.dirs
 
     def size_of(p):
@@ -66,7 +69,7 @@ def ask_candidates(con, res, now):
         return dirs[i][D_TALLOC] if i is not None else None
     old_apps = apps_mod.unused(apps_mod.collect(size_of, procs=[], now=now), ASK_AGE, now)
     old_apps.sort(key=lambda r: -(r["alloc"] or 0))
-    files = []
+    files, rs = [], RuleSet()
     for f in db.load_files(con):
         path, did, alloc, size, mtime, dataless = f[:6]
         if dataless or alloc < ASK_FILE_MIN or now - mtime < ASK_AGE:
@@ -75,6 +78,8 @@ def ask_candidates(con, res, now):
             continue  # ファイル規則（古いインストーラ等）に当たるものは review 側で出る
         tag = res.tag(did)
         if tag and tag[1] == "personal":
+            if not os.path.lexists(path) or clean_mod.personal_deny(path, rs):
+                continue
             files.append({"path": path, "alloc": alloc, "mtime": mtime, "area": tag[0]})
     files.sort(key=lambda r: -r["alloc"])
     return {"apps": old_apps, "files": files}
