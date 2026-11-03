@@ -2,6 +2,7 @@
 Mac 側のコピーを外す（クラウドには残る）。消さずに空ける手段。既定 dry-run、--yes で実行。
 移す前のチェックは clean --personal と同じ（clean.plan / clean.check）。完全削除はしない。"""
 import errno
+import fcntl
 import json
 import os
 import stat
@@ -207,18 +208,21 @@ def summarize(ops):
     """操作 ID ごとの {files, sigs, status, done, uploaded, uploading, evicted, errors, changed, missing}。
     この操作で前に evict が成功したファイル（op["evicted"]）は done に数え、照会も evict もしない
     （本人が後で再ダウンロードした物を外し直さない）。状態を確かめられなければ QueryError。"""
-    per, done = {}, {}
+    per, done, unconf = {}, {}, {}
     for o in ops:
         keep, sigs, changed, missing = op_files(o)
         ev = set(o.get("evicted") or ())
+        unc = set(o.get("unconfirmed") or ())  # evict を始めた記録だけで結果が無い（外れたか不明）。自動では外さない
         done[o["op_id"]] = sum(1 for f in keep if f in ev)
-        keep = [f for f in keep if f not in ev]
+        unconf[o["op_id"]] = sorted(f for f in keep if f in unc and f not in ev)
+        keep = [f for f in keep if f not in ev and f not in unc]
         per[o["op_id"]] = (keep, sigs, changed, missing)
     st = ic_status(list(dict.fromkeys(f for keep, _, _, _ in per.values() for f in keep)))
     out = {}
     for oid, (fs, sigs, changed, missing) in per.items():
         s = [st[f] for f in fs]
         out[oid] = {"files": fs, "sigs": [sigs[f] for f in fs], "status": s, "done": done[oid],
+                    "unconfirmed": unconf[oid],
                     "uploaded": sum(1 for x in s if x["state"] == "uploaded"),
                     "uploading": sum(1 for x in s if x["state"] == "uploading"),
                     "evicted": sum(1 for x in s if x["local"] == "NotDownloaded"),
@@ -257,12 +261,13 @@ def wait_upload(ops, minutes):
 
 def _row(o, x=None, query_error=None):
     row = {"op_id": o["op_id"], "dest": o["dest"], "files": 0, "uploaded": 0, "uploading": 0, "evicted_before": 0,
-           "done": 0, "errors": [], "changed": 0, "missing": 0, "evict": [], "evict_skipped": []}
+           "done": 0, "errors": [], "changed": 0, "missing": 0, "evict": [], "evict_skipped": [],
+           "unconfirmed": []}
     if query_error is not None:
         row["query_error"] = query_error
     if x is not None:
         d = x["done"]
-        row.update(files=len(x["files"]) + d, uploaded=x["uploaded"] + d, uploading=x["uploading"],
+        row.update(files=len(x["files"]) + d + len(x["unconfirmed"]), unconfirmed=x["unconfirmed"], uploaded=x["uploaded"] + d, uploading=x["uploading"],
                    evicted_before=x["evicted"] + d, done=d, errors=x["errors"], changed=x["changed"],
                    missing=x["missing"])
     return row
@@ -299,25 +304,38 @@ def settle(ops, yes, wait_min):
             r["state"] = "unknown"
         return rows
     rows = []
+    aborted = False  # 記録が書けなくなったら、以後どのファイルも evict しない
     for o in ops:
         x = s[o["op_id"]]
         row = _row(o, x)
         if yes:
             for f, sig, st in zip(x["files"], x["sigs"], x["status"]):
+                if aborted:
+                    break
                 if st["state"] == "uploaded" and st["local"] != "NotDownloaded":
                     why = same_now(f, sig)  # 照会中・前の evict の間に別物へ置き換わっていたら外さない
                     if why:
                         row["evict_skipped"].append({"path": f, "reason": why})
                         continue
+                    # 実行予定を先に永続化する。書けなければ外さない（結果が記録できずに外れた物を再開時に見分けるため）
+                    try:
+                        clean_mod._log({"time": clean_mod._now(), "type": "offload", "op": "evict_start",
+                                        "op_id": o["op_id"], "dest": o["dest"], "path": f})
+                    except OSError as e:
+                        row["log_error"] = str(e)
+                        aborted = True
+                        break
                     rc, msg = evict(f)
                     res = {"path": f, "rc": rc, "msg": msg}
                     row["evict"].append(res)
-                    # 成功はファイルごとにすぐ記録する（再開時にこの操作から同じファイルを外し直さないため）
+                    # 結果はファイルごとにすぐ記録する（再開時にこの操作から同じファイルを外し直さないため）
                     try:
                         clean_mod._log({"time": clean_mod._now(), "type": "offload", "op": "evict",
                                         "op_id": o["op_id"], "dest": o["dest"], "results": [res]})
                     except OSError as e:
                         row["log_error"] = str(e)
+                        aborted = True
+                        break
         rows.append(row)
     ev = [o for o, r in zip(ops, rows) if r["evict"]]
     if ev:
@@ -332,7 +350,7 @@ def settle(ops, yes, wait_min):
                     r["after_error"] = str(e)
     for r in rows:
         r["state"] = _state(r, timed_out)
-        if yes and r["state"] == "evicted":
+        if yes and r["state"] == "evicted" and not aborted:
             try:
                 clean_mod._log({"time": clean_mod._now(), "type": "offload", "op": "complete", "op_id": r["op_id"],
                                 "dest": r["dest"]})
@@ -385,6 +403,9 @@ def settle_lines(rows):
             st += f" ／ 移動後に追加・置換されたファイル {r['changed']}（外さない）"
         if r["missing"]:
             st += f" ／ 移動時から無くなったファイル {r['missing']}"
+        if r.get("unconfirmed"):
+            st += (f" ／ 要確認 {len(r['unconfirmed'])}: evict を始めた記録だけで結果が無い（外れたか不明）ので"
+                   f"自動では外さない（例: {util.disp(r['unconfirmed'][0])}）")
         if r.get("log_error"):
             st += f" ／ actions.jsonl に記録できない: {r['log_error']}"
         L.append(f"- {ic_disp(r['dest'])}: {st}")
@@ -520,15 +541,20 @@ def pending_ops():
         oid = e.get("op_id")
         if e.get("type") == "rename" and oid:
             if e.get("phase") == "begin" and e.get("src") and e.get("dst"):
-                ops[oid] = {"begin": e, "phase": None, "complete": False, "evicted": set()}
+                ops[oid] = {"begin": e, "phase": None, "complete": False, "evicted": set(),
+                             "started": set(), "resulted": set()}
             elif oid in ops:
                 ops[oid]["phase"] = e.get("phase")
         elif e.get("type") == "offload" and e.get("op") == "complete" and oid in ops:
             ops[oid]["complete"] = True
         elif e.get("type") == "offload" and e.get("op") == "evict" and oid in ops:
             for x in e.get("results") or []:
-                if isinstance(x, dict) and x.get("rc") == 0 and x.get("path"):
-                    ops[oid]["evicted"].add(x["path"])
+                if isinstance(x, dict) and x.get("path"):
+                    ops[oid]["resulted"].add(x["path"])
+                    if x.get("rc") == 0:
+                        ops[oid]["evicted"].add(x["path"])
+        elif e.get("type") == "offload" and e.get("op") == "evict_start" and oid in ops and e.get("path"):
+            ops[oid]["started"].add(e["path"])
     out, incomplete, n_complete = [], [], 0
     for oid, o in ops.items():
         b = o["begin"]
@@ -545,7 +571,8 @@ def pending_ops():
             n_complete += 1
         else:
             out.append({"op_id": oid, "src": b["src"], "dest": b["dst"], "files": b.get("files") or [],
-                        "evicted": sorted(o["evicted"])})
+                        "evicted": sorted(o["evicted"]),
+                        "unconfirmed": sorted(o["started"] - o["resulted"] - o["evicted"])})
     return out, incomplete, n_complete
 
 
@@ -564,8 +591,33 @@ def _item_lines(items):
     return L
 
 
+class _lock:
+    """evict する実行（--yes）の間、actions.jsonl の隣のロックファイルを排他で持つ（並行実行が古い一覧で二重に外さないため）。"""
+
+    def __enter__(self):
+        home = util.stor_home()
+        os.makedirs(home, exist_ok=True)
+        self.f = open(os.path.join(home, "actions.lock"), "a")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.f.close()
+            raise SystemExit("別の stor offload が実行中なので中止（何も動かしていない）。終わってからやり直す")
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()  # close でロックも外れる
+
+
 def run(args):
-    """戻り値 (obj, text, failed)。"""
+    """戻り値 (obj, text, failed)。--yes は排他ロックの中で、操作一覧の読込から結果記録までを行う。"""
+    if args.yes:
+        with _lock():
+            return _run(args)
+    return _run(args)
+
+
+def _run(args):
     if not os.path.isdir(icloud_root()):
         raise SystemExit(f"iCloud Drive が無い（{util.disp(icloud_root())}）。システム設定で iCloud Drive をオンにしてから")
     wait = WAIT_MAX_MIN if args.wait else 0

@@ -1469,6 +1469,63 @@ class StorTest(unittest.TestCase):
         self.assertEqual(evicted, [a, b])
         self.assertIn("evict まで完了した 1 件は対象外", self.run_cli("offload", "--status"))
 
+    def _two_uploaded(self):
+        h = self.home
+        put(f"{h}/Desktop/clip/a.mov", 20000)
+        put(f"{h}/Desktop/clip/b.mov", 20000)
+        root = self.icloud()
+        self.do_scan()
+        state = {}
+        evicted = self.fake_icloud(state)
+        self.run_cli("offload", f"{h}/Desktop/clip", "--yes")
+        a, b = f"{root}/Offload/clip/a.mov", f"{root}/Offload/clip/b.mov"
+        state[a] = ["uploaded", "Current"]
+        state[b] = ["uploaded", "Current"]
+        return state, evicted, a, b
+
+    def test_evict_result_log_failure_not_re_evicted(self):
+        state, evicted, a, b = self._two_uploaded()
+        real = clean_mod._log
+
+        def flaky(entry):
+            if entry.get("op") == "evict":
+                raise OSError(28, "No space left on device")
+            real(entry)
+        with mock.patch.object(clean_mod, "_log", side_effect=flaky):
+            out, rc = self.run_rc("offload", "--status", "--yes")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(len(evicted), 1)  # 結果が書けなくなったら後続のファイルは外さない
+        first, other = evicted[0], ({a, b} - {evicted[0]}).pop()
+        state[first] = ["uploaded", "Downloaded"]  # 本人が再ダウンロード
+        out, rc = self.run_rc("offload", "--status", "--yes")
+        self.assertEqual(evicted, [first, other])  # first は再開時に外し直さない
+        self.assertIn("要確認 1", out)
+
+    def test_evict_start_log_failure_does_not_evict(self):
+        state, evicted, a, b = self._two_uploaded()
+        real = clean_mod._log
+
+        def flaky(entry):
+            if entry.get("op") == "evict_start":
+                raise OSError(28, "No space left on device")
+            real(entry)
+        with mock.patch.object(clean_mod, "_log", side_effect=flaky):
+            out, rc = self.run_rc("offload", "--status", "--yes")
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(evicted, [])
+
+    def test_offload_yes_exits_when_locked(self):
+        import fcntl
+        state, evicted, a, b = self._two_uploaded()
+        with open(os.path.join(util.stor_home(), "actions.lock"), "a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(SystemExit) as cm:
+                self.run_cli("offload", "--status", "--yes")
+        self.assertIn("別の stor offload が実行中", str(cm.exception.code))
+        self.assertEqual(evicted, [])
+        self.run_cli("offload", "--status", "--yes")  # ロック解放後は通常どおり
+        self.assertEqual(sorted(evicted), sorted([a, b]))
+
     def test_d4_complete_log_failure_is_error(self):
         h = self.home
         put(f"{h}/Desktop/rec.mov", 20000)
