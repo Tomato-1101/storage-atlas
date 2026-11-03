@@ -16,4 +16,4 @@
 - ボイスメモ: iCloud Drive/ボイスメモ に43件コピー済み（退避済み）。アプリ側の削除は本人が「iPhone からも消えるならやめて」で全件復旧。今後触らない。
 - 残り（本人操作）: root 所有のアプリ4本（Final Cut・Motion・Pixelmator・Amphetamine）は Finder で。Claude VM は Claude アプリ終了後に `stor clean claude-vm-bundle --yes`。
 - 自作アプリ「外を見て」（Sotomite）は本人指示で削除（LaunchAgent 停止・アプリ・設定・~/Project/外を見て をゴミ箱へ。GitHub の非公開リポは残置）。
-- stor 改善（apps・--personal・offload・ゴミ箱 513 回避・出力要約・聞く候補）は ee158bf まで実装済み・テスト 58 件。Codex レビュー 2 回の指摘を反映し、3 回目を実施。
+- stor 改善（apps・--personal・offload・ゴミ箱 513 回避・出力要約・聞く候補）は 9cfbc76 まで実装済み・テスト 61 件。Codex レビュー 3 回の指摘を反映（最後の再 evict 防止は排他ロック・開始記録で対応）。
